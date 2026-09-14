@@ -1,0 +1,404 @@
+# Datomic indexing benchmark over GH Archive data — TOML form.
+#
+# Equivalent to datomic-index.jsonnet, but using the matrix table for sweeps,
+# which replaces the separate sweep-*.json files the jsonnet version needs.
+# Submit a single run by leaving [matrix] with one value per dimension; widen a
+# dimension to sweep it.
+#
+# Two facts about Datomic shape this spec:
+#
+#   1. Indexing happens in the TRANSACTOR process, not in the peer that calls
+#      d/transact. The transactor is therefore started with JMX exposed and the
+#      harness attaches to it for GC / JIT / CPU. Instrumenting the benchmark
+#      JVM would measure the wrong process.
+#
+#   2. Indexing is asynchronous and continuous: by the time a load finishes the
+#      transactor has already merged most novelty in the background, so
+#      d/sync-index only times the trailing merge (~2 s regardless of data
+#      size — measured). Real throughput comes from the transactor's own
+#      per-job accounting in its log (:index/create-index lines carrying
+#      :datoms and :msec). That is index_throughput; the sync-index wall time
+#      is kept separately as index_tail_s.
+#
+#   3. The peer JVM and the transactor JVM run in SEPARATE cgroups
+#      (datomic-peer / datomic-transactor). Both are heavyweight JVMs on the
+#      same host, so without separation the host-level CPU and IO figures
+#      conflate the thing under test with the thing driving it. Separate
+#      cgroups let each be accounted independently.
+#
+# Working-set sizes are quoted as RAW (uncompressed) source data, measured at
+# 563 MB / 180,686 events per archive hour:
+#   small   ~100 MB raw  (32k events)
+#   medium  ~1 GB raw    (329k events)
+#   large   ~10 GB raw   (3.285M events, needs ~19 archive hours)
+#
+# Measured baselines on amd (Ryzen 9 7900X, dev/H2, JDK21, G1, 4g heap):
+#   index_parallelism 1 -> 8    141k -> 198k datoms/s  (1.40x)
+#   threshold 16m -> 256m       103k -> 293k datoms/s  (2.84x, but ingest drops past 64m)
+#   size scaling                index throughput degrades with index size
+#
+# The PEERS dimension tests whether a single peer can saturate the transactor.
+# One peer pipelines transactions but they apply serially, and transactor CPU
+# sat at ~3.4 of 24 cores in every earlier run — which may be a transactor
+# ceiling or may just be an artefact of offering work through one pipe.
+
+name = "datomic-index-{RELEASE}-r{REPEAT}-{SIZE}-peers{PEERS}-p{INDEX_PARALLELISM}-t{MEM_THRESHOLD}-m{MEM_MAX}-{HEAP}-jdk{JDK}-{GC}"
+
+[params]
+HOST = "amd"
+# Datomic Pro release under test. Both the transactor distribution and the peer
+# library must be this version -- a peer/transactor version mismatch either
+# refuses to connect or silently exercises a different code path than intended,
+# so the benchmark step generates its own deps.edn pinned to RELEASE.
+#
+# 1.0.7393 is deliberately absent from the sweep list: S3 returns 403 for it
+# (withdrawn; 1.0.7394 shipped three days later).
+DTM = "/opt/datomic-bench"
+# The systemslab agent runs as uid 116 in group nogroup and cannot traverse
+# /home/xyang (drwxr-x---), so assets live under a shared root it owns and
+# scratch lives in its own home.
+SCRATCH = "/home/systemslab-agent/datomic-scratch"
+ITERATIONS = "3"
+BATCH = "200"
+# Archive hours to draw from. The harness reads a fixed EVENT COUNT per size
+# and stops, so listing more hours than a size needs is harmless — but `large`
+# (3.285M events) needs ~19 of them.
+HOURS = "15,16,17,18,19,20,21,22,23"
+INFLIGHT = "50"
+# Peer JVM heap. preload! materialises all tx-data before timing starts
+# (~0.0157 MB/event measured), so this bounds both working-set size and
+# how large a batch can be held.
+PEER_HEAP = "12g"
+WRITE_CONCURRENCY = "4"
+
+[matrix]
+# NOTE: the installed CLI predates matrix `context_name`; pass --name on submit.
+# Widen any dimension below to sweep it; the cartesian product becomes one
+# experiment per combination.
+RELEASE = [
+  "1.0.6726",
+  "1.0.6733",
+  "1.0.6735",
+  "1.0.7010",
+  "1.0.7021",
+  "1.0.7075",
+  "1.0.7180",
+  "1.0.7187",
+  "1.0.7260",
+  "1.0.7277",
+  "1.0.7364",
+  "1.0.7387",
+  "1.0.7394",
+  "1.0.7469",
+  "1.0.7482",
+  "1.0.7491",
+  "1.0.7556",
+  "1.0.7622",
+  "1.0.7705",
+]
+SIZE = ["medium"]                 # small ~100MB | medium ~1GB | large ~10GB raw source
+PEERS = ["1"]                     # concurrent peer JVMs driving the transactor
+INDEX_PARALLELISM = ["1"]         # 1..8 — Datomic ships 1, so merges are serial
+MEM_THRESHOLD = ["32m"]           # index job frequency; 64m was the measured knee
+MEM_MAX = ["512m"]                # backpressure point
+HEAP = ["4g"]                     # memory index shares this heap
+JDK = ["21"]                      # 17 | 21
+GC = ["g1"]                       # g1 | zgc | parallel
+# Independent invocations of the whole experiment (fresh JVMs, fresh storage).
+# Distinct from ITERATIONS, which are warmup passes inside one JVM. Averaging
+# across REPEAT captures run-to-run variance that iterations cannot see.
+# Three independent invocations per release; averaged by analyze-releases.py.
+REPEAT = ["1", "2", "3"]
+
+[[jobs]]
+name = "bench"
+tags = ["{HOST}"]
+
+# --- Preflight -------------------------------------------------------------
+# Fail loudly and early rather than producing a run whose numbers are quietly
+# wrong (wrong JDK, missing data, a surviving JVM holding the H2 write lock).
+[[jobs.steps]]
+type = "shell"
+command = """
+set -eu
+echo "=== host: $(hostname -s) ==="
+
+case "${JDK}" in
+  17|21) JH=/usr/lib/jvm/java-${JDK}-openjdk-amd64 ;;
+  *) echo "FATAL: unsupported JDK ${JDK}"; exit 1 ;;
+esac
+
+DIST="${DTM}/releases/datomic-pro-${RELEASE}"
+test -d "$DIST" || { echo "FATAL: release ${RELEASE} not staged at $DIST"; ls "${DTM}/releases" 2>/dev/null | head -30; exit 1; }
+test -x "$DIST/bin/transactor" || { echo "FATAL: no transactor in $DIST"; exit 1; }
+echo "release under test: ${RELEASE} ($(cat "$DIST/VERSION" 2>/dev/null || echo "no VERSION file"))"
+test -d "$JH" || { echo "FATAL: JDK not present: $JH"; ls /usr/lib/jvm/; exit 1; }
+"$JH/bin/java" -version 2>&1
+
+for h in $(echo ${HOURS} | tr ',' ' '); do
+  f="${DTM}/gh/2024-01-01-$h.json.gz"
+  test -s "$f" || { echo "FATAL: missing data $f"; exit 1; }
+  echo "data ok: $f ($(stat -c%s "$f") bytes)"
+done
+
+pkill -x java 2>/dev/null || true
+sleep 3
+if pgrep -x java >/dev/null; then echo "FATAL: java still running"; exit 1; fi
+
+# Fresh storage per variant: a carried-over H2 file would let an earlier
+# variant's segments change this one's merge costs.
+mkdir -p "${SCRATCH}"
+rm -rf "${SCRATCH}/sweep-data" "${SCRATCH}/sweep-log"
+mkdir -p "${SCRATCH}/sweep-data" "${SCRATCH}/sweep-log"
+echo "preflight ok"
+"""
+
+# --- Start the transactor under test ---------------------------------------
+[[jobs.steps]]
+type = "shell"
+# Peer and transactor are separate JVMs on this host; isolating them in
+# sibling cgroups keeps their CPU/memory/IO accounted separately.
+cgroup = "datomic-transactor"
+command = """
+set -eu
+JH=/usr/lib/jvm/java-${JDK}-openjdk-amd64
+export JAVA_HOME="$JH"
+export PATH="$JAVA_HOME/bin:$PATH"
+
+case "${GC}" in
+  zgc)      GC_OPTS="-XX:+UseZGC -XX:+ZGenerational" ;;
+  parallel) GC_OPTS="-XX:+UseParallelGC" ;;
+  *)        GC_OPTS="-XX:+UseG1GC -XX:MaxGCPauseMillis=50" ;;
+esac
+
+# Written here rather than by a write_file step: keeping the properties next to
+# the launch keeps the variant's configuration in one place.
+{
+  echo "protocol=dev"
+  echo "host=localhost"
+  echo "port=4334"
+  echo "data-dir=${SCRATCH}/sweep-data"
+  echo "log-dir=${SCRATCH}/sweep-log"
+  echo "memory-index-threshold=${MEM_THRESHOLD}"
+  echo "memory-index-max=${MEM_MAX}"
+  echo "object-cache-max=1g"
+  echo "index-parallelism=${INDEX_PARALLELISM}"
+  echo "write-concurrency=${WRITE_CONCURRENCY}"
+  # Datomic metrics callback: the supported source for IndexDatoms /
+  # IndexWrites / TransactionMsec etc. The log parser stays as a
+  # cross-check, but it depends on an unstable log format.
+  echo "metrics-callback=bench.metrics/transactor"
+} > "${SCRATCH}/sweep.properties"
+cat "${SCRATCH}/sweep.properties"
+
+cd "${DTM}/releases/datomic-pro-${RELEASE}"
+nohup bin/transactor \
+  -Xmx${HEAP} -Xms${HEAP} \
+  $GC_OPTS \
+  -Dcom.sun.management.jmxremote \
+  -Dcom.sun.management.jmxremote.port=7091 \
+  -Dcom.sun.management.jmxremote.rmi.port=7091 \
+  -Dcom.sun.management.jmxremote.local.only=false \
+  -Dcom.sun.management.jmxremote.authenticate=false \
+  -Dcom.sun.management.jmxremote.ssl=false \
+  -Dbench.metrics.transactor.out="${SCRATCH}/metrics-transactor.jsonl" \
+  -Djava.rmi.server.hostname=127.0.0.1 \
+  "${SCRATCH}/sweep.properties" > "${SCRATCH}/sweep-transactor.log" 2>&1 &
+
+for i in $(seq 1 60); do
+  grep -q "System started" "${SCRATCH}/sweep-transactor.log" && break
+  sleep 1
+done
+grep -q "System started" "${SCRATCH}/sweep-transactor.log" || {
+  echo "FATAL: transactor did not start"; cat "${SCRATCH}/sweep-transactor.log"; exit 1; }
+
+PID=$(pgrep -f datomic.launcher | head -1)
+echo "$PID" > "${SCRATCH}/txor.pid"
+echo "transactor pid=$PID"
+# Confirm it really is the JDK we asked for, not a stale default.
+ls -l /proc/$PID/exe
+# Record the cgroup so the benchmark step can verify the two JVMs are separated.
+cat /proc/$PID/cgroup | tee "${SCRATCH}/txor.cgroup"
+"""
+
+# --- The benchmark ---------------------------------------------------------
+[[jobs.steps]]
+type = "shell"
+# Peer and transactor are separate JVMs on this host; isolating them in
+# sibling cgroups keeps their CPU/memory/IO accounted separately.
+cgroup = "datomic-peer"
+command = """
+set -eu
+export JAVA_HOME=/usr/lib/jvm/java-${JDK}-openjdk-amd64
+export PATH="$JAVA_HOME/bin:$PATH"
+PID=$(cat "${SCRATCH}/txor.pid")
+
+FILES=""
+for h in $(echo ${HOURS} | tr ',' ' '); do
+  FILES="${FILES}${FILES:+,}${DTM}/gh/2024-01-01-$h.json.gz"
+done
+echo "files: $FILES"
+
+echo "peer cgroup:       $(cat /proc/self/cgroup)"
+echo "transactor cgroup: $(cat ${SCRATCH}/txor.cgroup 2>/dev/null || echo unknown)"
+
+# The peer library must match the transactor release under test. Build an
+# isolated project per release rather than editing the shared bench tree, so
+# concurrent or repeated runs cannot race on one deps.edn.
+BENCH="${SCRATCH}/bench-${RELEASE}"
+rm -rf "$BENCH"
+mkdir -p "$BENCH"
+cp -r "${DTM}/bench/src" "$BENCH/src"
+cat > "$BENCH/deps.edn" <<DEPS
+{:paths ["src"]
+ :deps {com.datomic/peer {:mvn/version "${RELEASE}"}
+        org.clojure/clojure {:mvn/version "1.12.0"}
+        org.clojure/data.json {:mvn/version "2.5.1"}}}
+DEPS
+cat "$BENCH/deps.edn"
+
+cd "$BENCH"
+clojure -J-Xmx${PEER_HEAP} -J-server \
+  -J-Ddatomic.metricsCallback=bench.metrics/peer \
+  -J-Dbench.metrics.peer.out="${SCRATCH}/metrics-peer.jsonl" \
+  -M -m bench.idxbench \
+  --size ${SIZE} \
+  --iterations ${ITERATIONS} \
+  --batch ${BATCH} \
+  --peers ${PEERS} \
+  --inflight ${INFLIGHT} \
+  --files "$FILES" \
+  --jmx localhost:7091 \
+  --pid "$PID" \
+  --log-dir "${SCRATCH}/sweep-log" \
+  --out "${SCRATCH}/idxbench.json" 2>&1 | tee "${SCRATCH}/idxbench.log"
+
+test -s "${SCRATCH}/idxbench.json" || { echo "FATAL: no result json"; exit 1; }
+"""
+
+# --- Flatten the final iteration into a comparable one-liner ---------------
+[[jobs.steps]]
+type = "write_file"
+path = "summarise.py"
+content = """
+import json, sys
+d = json.load(open(sys.argv[1]))
+f = d['final']; j = f.get('jvm', {})
+json.dump({
+  'size': d['size'], 'events': d['events'], 'datoms': f['datoms'],
+  'iterations': d['iterations'],
+  'index_throughput_datoms_per_sec': f.get('index-throughput'),
+  'index_jobs': f.get('index-jobs'),
+  'index_datoms': f.get('index-datoms'),
+  'index_job_seconds': (f.get('index-job-ms') or 0) / 1000.0,
+  'index_segments': f.get('index-segments'),
+  'index_tail_s': (f.get('index-tail-ms') or 0) / 1000.0,
+  'ingest_events_per_sec': f.get('events-per-sec'),
+  'ingest_datoms_per_sec': f.get('datoms-per-sec'),
+  'load_s': (f.get('load-ms') or 0) / 1000.0,
+  'total_s': (f.get('total-ms') or 0) / 1000.0,
+  'gc_count': j.get('gc-count'), 'gc_ms': j.get('gc-ms'), 'gc_pct': j.get('gc-pct'),
+  'jit_ms': j.get('jit-ms'), 'jit_pct': j.get('jit-pct'),
+  'txor_cpu_cores': j.get('proc-cpu-cores'),
+  'txor_cpu_pct_host': j.get('proc-cpu-pct-host'),
+  'host_cpu_pct': j.get('host-cpu-pct'),
+  'host_iowait_pct': j.get('host-iowait-pct'),
+  'io_write_bytes': j.get('io-write-bytes'),
+  'io_write_MBps': j.get('io-write-MBps'),
+  'heap_used_after': j.get('heap-used-after'), 'heap_max': j.get('heap-max'),
+  'threads': j.get('threads-after'),
+}, sys.stdout, indent=2)
+"""
+
+# --- Collect artifacts into the step working directory ---------------------
+# Steps share one working directory, and upload_artifact resolves relative to
+# it, so gathering and uploading can happen in separate steps.
+[[jobs.steps]]
+type = "shell"
+command = """
+set -eu
+cp "${SCRATCH}/idxbench.json" idxbench.json
+cp "${SCRATCH}/idxbench.log"  idxbench.log
+cp "${SCRATCH}/sweep-transactor.log" transactor.log || true
+grep -h "index/create-index" "${SCRATCH}"/sweep-log/*.log > index-jobs.log 2>/dev/null || true
+
+# Datomic calls the metrics callback on its own schedule (~1/min), so a short
+# run may legitimately produce no samples. Always create the files: a missing
+# path fails upload_artifact and therefore the whole experiment.
+cp "${SCRATCH}/metrics-transactor.jsonl" metrics-transactor.jsonl 2>/dev/null || true
+cp "${SCRATCH}/metrics-peer.jsonl" metrics-peer.jsonl 2>/dev/null || true
+touch metrics-transactor.jsonl metrics-peer.jsonl
+wc -l metrics-transactor.jsonl metrics-peer.jsonl || true
+
+# Per-cgroup CPU accounting. The peer and transactor are separate JVMs on
+# the same host; without this the host CPU figure conflates driver and
+# subject. The agent roots its cgroups under its own service slice.
+: > cgroup-cpu.txt
+CGROOT=/sys/fs/cgroup/system.slice/systemslab-agent.service/systemslab
+for cg in datomic-transactor datomic-peer; do
+  d=$(find "$CGROOT" -maxdepth 3 -type d -name "*${cg}*" 2>/dev/null | head -1)
+  if [ -n "$d" ]; then
+    echo "=== $cg ($d)" >> cgroup-cpu.txt
+    for f in cpu.stat memory.peak io.stat pids.peak; do
+      [ -r "$d/$f" ] && { echo "--- $f"; cat "$d/$f"; } >> cgroup-cpu.txt 2>/dev/null
+    done
+  else
+    echo "=== $cg NOT FOUND under $CGROOT" >> cgroup-cpu.txt
+  fi
+done
+# Record the tree even if the named dirs are gone, so a miss is diagnosable.
+echo "=== cgroup tree ===" >> cgroup-cpu.txt
+find "$CGROOT" -maxdepth 3 -type d 2>/dev/null >> cgroup-cpu.txt || true
+cat cgroup-cpu.txt || true
+python3 summarise.py idxbench.json > summary.json
+echo "=== summary ==="
+cat summary.json
+echo
+wc -l index-jobs.log || true
+"""
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "summary.json"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "idxbench.json"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "idxbench.log"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "transactor.log"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "index-jobs.log"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "metrics-transactor.jsonl"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "metrics-peer.jsonl"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "cgroup-cpu.txt"
+
+# --- Always leave the host clean -------------------------------------------
+[[jobs.steps]]
+type = "shell"
+command = """
+pkill -x java 2>/dev/null || true
+sleep 2
+rm -rf "${SCRATCH}/sweep-data"
+echo "cleaned up"
+"""
+
+[metadata]
+description = "Datomic {SIZE} indexing benchmark over GH Archive ({ITERATIONS} iterations, {PEERS} peer JVM(s), index-parallelism={INDEX_PARALLELISM}, mem-threshold={MEM_THRESHOLD}, heap={HEAP}, jdk{JDK}, {GC})"
+reference = "transactor :index/create-index job accounting"

@@ -1,0 +1,20 @@
+[
+ {
+  "size": "small",
+  "host": "amd",
+  "iterations": "3",
+  "hours": "15,16"
+ },
+ {
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3",
+  "hours": "15,16"
+ },
+ {
+  "size": "large",
+  "host": "amd",
+  "iterations": "3",
+  "hours": "15,16,17,18"
+ }
+]

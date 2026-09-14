@@ -1,0 +1,26 @@
+[
+ {
+  "index_parallelism": "1",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "index_parallelism": "2",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "index_parallelism": "4",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "index_parallelism": "8",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ }
+]

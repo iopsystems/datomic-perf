@@ -1,0 +1,32 @@
+[
+ {
+  "memory_index_threshold": "16m",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "memory_index_threshold": "32m",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "memory_index_threshold": "64m",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "memory_index_threshold": "128m",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "memory_index_threshold": "256m",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ }
+]

@@ -1,0 +1,14 @@
+[
+ {
+  "jdk": "17",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "jdk": "21",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ }
+]

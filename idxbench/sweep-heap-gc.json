@@ -1,0 +1,65 @@
+[
+ {
+  "heap": "4g",
+  "gc": "g1",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "heap": "4g",
+  "gc": "zgc",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "heap": "4g",
+  "gc": "parallel",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "heap": "8g",
+  "gc": "g1",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "heap": "8g",
+  "gc": "zgc",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "heap": "8g",
+  "gc": "parallel",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "heap": "16g",
+  "gc": "g1",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "heap": "16g",
+  "gc": "zgc",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ },
+ {
+  "heap": "16g",
+  "gc": "parallel",
+  "size": "medium",
+  "host": "amd",
+  "iterations": "3"
+ }
+]
