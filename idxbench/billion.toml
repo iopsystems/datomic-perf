@@ -1,0 +1,283 @@
+# Index one billion datoms from GH Archive, then back the database up to the
+# local instance-store NVMe and time the backup.
+#
+# Two things make this different from the other specs in this suite:
+#
+#   1. It uses bench.bigindex, not bench.idxbench. idxbench preloads every
+#      transaction into the peer heap before timing (~0.0157 MB/event measured),
+#      which at the ~137M events needed here would be ~2 TB. bigindex streams:
+#      a producer thread parses and converts onto a bounded queue while the
+#      consumer transacts, so memory is bounded by queue depth, not dataset size.
+#
+#   2. It runs to a DATOM TARGET rather than a fixed event count, sampling
+#      db-stats every 15s, and then runs `bin/datomic backup-db` and times it.
+#
+# Storage and backup both live on /mnt/datomic (the i3en instance-store NVMe).
+# Note that volume is ephemeral -- it is wiped on instance stop/start, which has
+# already happened once during this work.
+#
+# Measured at 5.7M datoms on this host before scaling up:
+#   ingest 34,944 datoms/s | index 63,074 datoms/s | backup 8.4s for 0.10 GiB
+# Extrapolating: ~8 hours to load, ~17 GiB backup at ~25 min.
+
+name = "datomic-billion-datoms"
+
+[params]
+HOST = "datomic.perf"
+R = "/mnt/datomic/datomic-bench"
+RELEASE = "1.0.7705"
+TARGET = "1000000000"
+BATCH = "1000"
+INFLIGHT = "500"
+QUEUE = "2000"
+# Balanced setting from the tuning sweep on this host: 64m gave the best
+# index throughput that did not cost ingest, and ingest sets the runtime here.
+MEM_THRESHOLD = "64m"
+MEM_MAX = "2g"
+INDEX_PARALLELISM = "8"
+TXOR_HEAP = "8g"
+PEER_HEAP = "8g"
+
+[[jobs]]
+name = "bench"
+tags = ["{HOST}"]
+
+# --- Preflight -------------------------------------------------------------
+[[jobs.steps]]
+type = "shell"
+# Isolate the transactor so its CPU/memory/IO are accounted separately from the
+# peer driving it.
+cgroup = "datomic-transactor"
+command = """
+set -eu
+echo "=== host: $(hostname -s) ==="
+
+JH=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/dev/null | head -1)
+[ -n "$JH" ] || { echo "FATAL: JDK 21 not found"; ls /usr/lib/jvm/; exit 1; }
+"$JH/bin/java" -version 2>&1 | head -1
+
+# The instance store is ephemeral; if the host was stopped/started the mount and
+# everything staged on it is gone. Fail loudly rather than silently writing the
+# database to the small EBS root volume.
+mountpoint -q /mnt/datomic || { echo "FATAL: /mnt/datomic not mounted (instance store wiped?)"; exit 1; }
+test -x "${R}/releases/datomic-pro-${RELEASE}/bin/transactor" || { echo "FATAL: no transactor at ${R}/releases/datomic-pro-${RELEASE}"; exit 1; }
+test -f "${R}/bench/src/bench/bigindex.clj" || { echo "FATAL: bigindex.clj not staged"; exit 1; }
+
+NF=$(ls ${R}/gh/*.json.gz 2>/dev/null | wc -l)
+echo "archive files: $NF  ($(du -sh ${R}/gh | cut -f1))"
+[ "$NF" -ge 500 ] || { echo "FATAL: only $NF archive files; need ~700 for 1B datoms of real events"; exit 1; }
+
+# 1B datoms needs roughly 58 GiB of H2 storage plus ~17 GiB of backup.
+AVAIL=$(df -BG --output=avail /mnt/datomic | tail -1 | tr -dc '0-9')
+echo "free on /mnt/datomic: ${AVAIL} GiB"
+[ "$AVAIL" -ge 150 ] || { echo "FATAL: need >=150 GiB free, have ${AVAIL}"; exit 1; }
+
+pkill -9 -x java 2>/dev/null || true
+sleep 3
+pgrep -x java >/dev/null && { echo "FATAL: java still running"; exit 1; } || true
+
+rm -rf "${R}/scratch/billion" "${R}/backup/billion"
+mkdir -p "${R}/scratch/billion/data" "${R}/scratch/billion/log"
+echo "preflight ok"
+"""
+
+# --- Start the transactor --------------------------------------------------
+[[jobs.steps]]
+type = "shell"
+cgroup = "datomic-transactor"
+command = """
+set -eu
+S=${R}/scratch/billion
+export JAVA_HOME=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/dev/null | head -1)
+export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
+
+{
+  echo "protocol=dev"
+  echo "host=localhost"
+  echo "port=4334"
+  echo "data-dir=$S/data"
+  echo "log-dir=$S/log"
+  echo "memory-index-threshold=${MEM_THRESHOLD}"
+  echo "memory-index-max=${MEM_MAX}"
+  echo "object-cache-max=2g"
+  echo "index-parallelism=${INDEX_PARALLELISM}"
+  echo "write-concurrency=4"
+  echo "metrics-callback=bench.metrics/transactor"
+} > "$S/p.properties"
+cat "$S/p.properties"
+
+cd "${R}/releases/datomic-pro-${RELEASE}"
+nohup bin/transactor \
+  -Xmx${TXOR_HEAP} -Xms${TXOR_HEAP} -XX:+UseG1GC -XX:MaxGCPauseMillis=50 \
+  -Ddatomic.prefetchConcurrency=16 \
+  -Dbench.metrics.transactor.out="$S/metrics-transactor.jsonl" \
+  -Dcom.sun.management.jmxremote \
+  -Dcom.sun.management.jmxremote.port=7091 \
+  -Dcom.sun.management.jmxremote.rmi.port=7091 \
+  -Dcom.sun.management.jmxremote.local.only=false \
+  -Dcom.sun.management.jmxremote.authenticate=false \
+  -Dcom.sun.management.jmxremote.ssl=false \
+  -Djava.rmi.server.hostname=127.0.0.1 \
+  "$S/p.properties" > "$S/transactor.out" 2>&1 &
+
+for i in $(seq 1 120); do grep -q "System started" "$S/transactor.out" && break; sleep 1; done
+grep -q "System started" "$S/transactor.out" || { echo "FATAL: transactor did not start"; tail -30 "$S/transactor.out"; exit 1; }
+PID=$(pgrep -f datomic.launcher | head -1)
+echo "$PID" > "$S/txor.pid"
+echo "transactor pid=$PID  storage=$(df -h $S/data | tail -1 | awk '{print $1}')"
+cat /proc/$PID/cgroup | tee "$S/txor.cgroup"
+"""
+
+# --- Load to 1B datoms, then back up --------------------------------------
+[[jobs.steps]]
+type = "shell"
+cgroup = "datomic-peer"
+command = """
+set -eu
+S=${R}/scratch/billion
+export JAVA_HOME=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/dev/null | head -1)
+export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
+PID=$(cat "$S/txor.pid")
+
+echo "peer cgroup      : $(cat /proc/self/cgroup)"
+echo "transactor cgroup: $(cat $S/txor.cgroup)"
+
+FILES=$(ls ${R}/gh/*.json.gz | sort | paste -sd,)
+echo "files: $(ls ${R}/gh/*.json.gz | wc -l)"
+
+BENCH=$S/bench
+mkdir -p "$BENCH"
+cp -r "${R}/bench/src" "$BENCH/src"
+cat > "$BENCH/deps.edn" <<DEPS
+{:paths ["src"]
+ :deps {com.datomic/peer {:mvn/version "${RELEASE}"}
+        org.clojure/clojure {:mvn/version "1.12.0"}
+        org.clojure/data.json {:mvn/version "2.5.1"}}}
+DEPS
+
+cd "$BENCH"
+clojure -J-Xmx${PEER_HEAP} -J-server \
+  -J-Ddatomic.metricsCallback=bench.metrics/peer \
+  -J-Dbench.metrics.peer.out="$S/metrics-peer.jsonl" \
+  -M -m bench.bigindex \
+  --target-datoms ${TARGET} \
+  --files "$FILES" \
+  --batch ${BATCH} --inflight ${INFLIGHT} --queue ${QUEUE} \
+  --jmx localhost:7091 --pid "$PID" \
+  --log-dir "$S/log" \
+  --uri "datomic:dev://localhost:4334/billion" \
+  --dist "${R}/releases/datomic-pro-${RELEASE}" \
+  --backup-dir "${R}/backup/billion" \
+  --out "$S/result.json" \
+  --progress "$S/progress.jsonl" 2>&1 | tee "$S/bigindex.log"
+
+test -s "$S/result.json" || { echo "FATAL: no result.json"; exit 1; }
+"""
+
+# --- Collect ---------------------------------------------------------------
+[[jobs.steps]]
+type = "shell"
+command = """
+set -eu
+S=${R}/scratch/billion
+cp "$S/result.json" result.json
+cp "$S/progress.jsonl" progress.jsonl
+cp "$S/bigindex.log" bigindex.log
+cp "$S/transactor.out" transactor.out || true
+grep -h "index/create-index" "$S"/log/*.log > index-jobs.log 2>/dev/null || true
+grep -h "process-monitor" "$S"/log/*.log > process-monitor.log 2>/dev/null || true
+cp "$S/metrics-transactor.jsonl" metrics-transactor.jsonl 2>/dev/null || true
+cp "$S/metrics-peer.jsonl" metrics-peer.jsonl 2>/dev/null || true
+touch metrics-transactor.jsonl metrics-peer.jsonl
+
+: > cgroup-cpu.txt
+CGROOT=/sys/fs/cgroup/system.slice/systemslab-agent.service/systemslab
+for cg in datomic-transactor datomic-peer; do
+  d=$(find "$CGROOT" -maxdepth 3 -type d -name "*${cg}*" 2>/dev/null | head -1)
+  if [ -n "$d" ]; then
+    echo "=== $cg ($d)" >> cgroup-cpu.txt
+    for f in cpu.stat memory.peak io.stat; do
+      [ -r "$d/$f" ] && { echo "--- $f"; cat "$d/$f"; } >> cgroup-cpu.txt 2>/dev/null
+    done
+  else
+    echo "=== $cg NOT FOUND" >> cgroup-cpu.txt
+  fi
+done
+
+{
+  echo "=== storage ==="
+  du -sh "$S/data" 2>/dev/null || true
+  echo "=== backup ==="
+  du -sh "${R}/backup/billion" 2>/dev/null || true
+  df -h /mnt/datomic | tail -1
+} > storage.txt
+
+echo "=== headline ==="
+python3 - <<'PY'
+import json
+d=json.load(open('result.json'))
+b=d.get('backup') or {}
+print(f"datoms            {d['datoms']:,}")
+print(f"events            {d['events']:,}  (txs {d['txs']:,}, cycles {d['cycles']})")
+print(f"load wall         {d['load-ms']/3600000:.2f} h")
+print(f"ingest            {d['ingest-datoms-per-sec']:,.0f} datoms/s")
+print(f"index throughput  {(d.get('index-throughput') or 0):,.0f} datoms/s ({d['index-jobs']} jobs)")
+if b:
+    print(f"backup latency    {b.get('backup-ms',0)/1000:.1f} s ({b.get('backup-ms',0)/60000:.2f} min)")
+    if b.get('bytes'): print(f"backup size       {b['bytes']/2**30:.2f} GiB")
+    print(f"backup exit       {b.get('exit')}")
+PY
+cat storage.txt
+"""
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "result.json"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "progress.jsonl"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "bigindex.log"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "index-jobs.log"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "process-monitor.log"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "metrics-transactor.jsonl"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "cgroup-cpu.txt"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "storage.txt"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "transactor.out"
+
+# --- Leave the host clean (but keep the backup for inspection) -------------
+[[jobs.steps]]
+type = "shell"
+command = """
+pkill -9 -x java 2>/dev/null || true
+sleep 2
+# The database is large; drop it but keep the backup directory.
+rm -rf "${R}/scratch/billion/data"
+df -h /mnt/datomic | tail -1
+echo "cleaned up (backup retained at ${R}/backup/billion)"
+"""
+
+[metadata]
+description = "Index 1,000,000,000 datoms from GH Archive on i3en.2xlarge instance-store NVMe, then back up the database and measure backup latency"
+reference = "transactor :index/create-index accounting; bin/datomic backup-db"

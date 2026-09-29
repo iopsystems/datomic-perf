@@ -1,0 +1,47 @@
+<configuration>
+
+  <contextListener class="ch.qos.logback.classic.jul.LevelChangePropagator">
+    <resetJUL>true</resetJUL>
+  </contextListener>
+
+  <appender name="MAIN" class="ch.qos.logback.core.rolling.RollingFileAppender">
+    <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+      <fileNamePattern>${DATOMIC_LOG_DIR:-log}/%d{yyyy-MM-dd}.log</fileNamePattern>
+      <maxHistory>72</maxHistory>
+    </rollingPolicy>
+    <prudent>true</prudent>
+    <encoder>
+      <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level %-10contextName %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <logger name="datomic.cast2slf4j" level="DEBUG"/>
+
+  <!-- BENCHMARK: indexing job accounting. Emits :index/create-index lines
+       carrying :datoms and :msec, which are the authoritative index throughput
+       source (d/sync-index only times the trailing merge). -->
+  <logger name="datomic.index" level="INFO"/>
+
+  <!-- BENCHMARK: periodic metrics rollup. Emits :Datoms, :CreateEntireIndexMsec,
+       :IndexWrites, :TransactionMsec etc. as {:lo :hi :sum :count} maps. -->
+  <logger name="datomic.process-monitor" level="INFO"/>
+
+  <logger name="org.apache.activemq.audit" level="WARN"/>
+  <logger name="httpclient" level="INFO"/>
+  <logger name="org.apache.commons.httpclient" level="INFO"/>
+  <logger name="org.apache.http" level="INFO"/>
+  <logger name="org.jets3t" level="INFO"/>
+  <logger name="software.amazon.awssdk" level="INFO"/>
+  <logger name="software.amazon.awssdk.request" level="WARN"/>
+  <logger name="software.amazon.awssdk.metrics.LoggingMetricPublisher" level="WARN"/>
+  <logger name="sun.rmi" level="INFO"/>
+  <logger name="datomic.spy.memcached" level="INFO"/>
+  <logger name="com.ning.http.client.providers.netty" level="INFO"/>
+  <logger name="org.eclipse.jetty" level="INFO"/>
+  <logger name="org.hornetq.core.client.impl" level="INFO"/>
+  <logger name="org.apache.tomcat.jdbc.pool" level="INFO"/>
+
+  <root level="info">
+    <appender-ref ref="MAIN"/>
+  </root>
+</configuration>

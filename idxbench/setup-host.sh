@@ -32,10 +32,24 @@ RELEASES="1.0.6726 1.0.6733 1.0.6735 1.0.7010 1.0.7021 1.0.7075 1.0.7180
 
 step_prereqs() {
   echo "==> prerequisites"
-  sudo apt-get update -qq
-  # Datomic 1.0.7705 requires Java 17+; both JDKs are needed for the jdk sweep.
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-    openjdk-21-jdk-headless openjdk-17-jdk-headless unzip curl
+  # JDK 21 is required; JDK 17 is only needed for the jdk sweep and is not
+  # available everywhere (Rocky 10 ships 21 and 25 only). They are installed in
+  # separate transactions on purpose: a package manager rejects the whole
+  # install when one name is unresolvable, and with `set -e` above that aborts
+  # the run before anything is staged -- which is what happened on Rocky, where
+  # requesting 17 alongside 21 left the host with no JVM at all.
+  if command -v dnf >/dev/null; then
+    sudo dnf install -y -q java-21-openjdk-headless unzip curl rsync
+    sudo dnf install -y -q java-17-openjdk-headless 2>/dev/null \
+      || echo "  note: JDK 17 unavailable here; the jdk sweep will be limited to 21"
+  else
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      openjdk-21-jdk-headless unzip curl rsync
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      openjdk-17-jdk-headless 2>/dev/null \
+      || echo "  note: JDK 17 unavailable here; the jdk sweep will be limited to 21"
+  fi
   if ! command -v clojure >/dev/null; then
     curl -sSL -o /tmp/clj-install.sh https://download.clojure.org/install/linux-install.sh
     chmod +x /tmp/clj-install.sh && sudo /tmp/clj-install.sh
@@ -104,8 +118,10 @@ step_verify() {
   sudo -u "$AGENT_USER" test -x "$ROOT/releases/datomic-pro-1.0.7705/bin/transactor" \
     && echo "  transactor executable: OK" || echo "  transactor executable: FAILED"
   for j in 17 21; do
-    test -d "/usr/lib/jvm/java-$j-openjdk-amd64" \
-      && echo "  jdk$j: OK" || echo "  jdk$j: MISSING"
+    d=$(ls -d /usr/lib/jvm/java-$j-openjdk* 2>/dev/null | head -1)
+    if [ -n "$d" ]; then echo "  jdk$j: OK ($d)"
+    elif [ "$j" = "21" ]; then echo "  jdk21: MISSING (required)"
+    else echo "  jdk17: absent (optional; jdk sweep limited to 21)"; fi
   done
   echo "  disk: $(df -h "$ROOT" | tail -1 | awk '{print $4}') free"
 }
