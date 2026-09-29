@@ -1,0 +1,13 @@
+;; Standalone deps for running the harness by hand.
+;;
+;; The Systemslab spec does NOT use this file -- it generates an equivalent one
+;; per release so the peer library version always matches the transactor under
+;; test. A peer/transactor version mismatch either refuses to connect or
+;; silently exercises a different code path, so when running manually, set the
+;; peer version to match the transactor you started.
+;;
+;; Add org.postgresql/postgresql {:mvn/version "42.7.11"} for protocol=sql.
+{:paths ["src"]
+ :deps {com.datomic/peer       {:mvn/version "1.0.7705"}
+        org.clojure/clojure    {:mvn/version "1.12.0"}
+        org.clojure/data.json  {:mvn/version "2.5.1"}}}

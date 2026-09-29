@@ -114,8 +114,8 @@
 
 (defn run-iteration!
   [{:keys [uri-base uri-suffix tx-batches jmx log-dir txor-pid ncpu iteration
-            peers inflight-per-peer]
-     :or {peers 1 inflight-per-peer 50 uri-suffix ""}}]
+            peers inflight-per-peer hints? sync-index?]
+     :or {peers 1 inflight-per-peer 50 uri-suffix "" hints? false sync-index? true}}]
   (let [dbname (str "idxbench-" (System/currentTimeMillis) "-" iteration)
         uri    (str uri-base dbname uri-suffix)
         _      (d/create-database uri)
@@ -153,7 +153,15 @@
                                (let [c (d/connect uri)]
                                  (loop [bs my-batches inflight []]
                                    (if-let [bb (first bs)]
-                                     (let [f (d/transact-async c bb)
+                                     (let [;; Transaction hints: speculatively run the tx on the peer
+                                           ;; with :return-hints, then pass the hints to the
+                                           ;; transactor so it can prefetch db-before reads
+                                           ;; exhaustively instead of discovering them serially.
+                                           ;; Requires Datomic >= 1.0.7260.
+                                           f (if hints?
+                                               (let [h (:hints (d/with (d/db c) bb :return-hints true))]
+                                                 (d/transact-async c bb :hints h))
+                                               (d/transact-async c bb))
                                            _ (swap! n-ev + (count bb))
                                            inf (conj inflight f)]
                                        (if (>= (count inf) inflight-per-peer)
@@ -164,10 +172,17 @@
                  (doseq [f futs] @f))
           t-load (System/nanoTime)
 
-          ;; ---- INDEX: force the tail merge and wait ----
+          ;; ---- INDEX ----
+          ;; sync-index only times the trailing merge -- background indexing has
+          ;; already done most of the work by the time the load ends. With
+          ;; sync-index? false we skip it entirely and let the transactor's own
+          ;; job accounting (parsed from its log) be the sole throughput source,
+          ;; which is what the reported number has always been derived from.
           bt     (d/basis-t (d/db conn))
-          _      (d/request-index conn)
-          idb    (deref (d/sync-index conn bt) 1800000 :timeout)
+          idb    (if sync-index?
+                   (do (d/request-index conn)
+                       (deref (d/sync-index conn bt) 1800000 :timeout))
+                   :skipped)
           t-idx  (System/nanoTime)
 
           jvm1   (jvm/snapshot jmx)
@@ -193,6 +208,8 @@
        :events @n-ev
        :datoms datoms
        :timed-out (= idb :timeout)
+       :sync-index-skipped (= idb :skipped)
+       :hints hints?
 
        ;; --- primary metrics ---
        :load-ms load-ms
@@ -231,7 +248,8 @@
     (flush)))
 
 (defn -main [& args]
-  (let [{:strs [size iterations files jmx log-dir pid out batch peers inflight protocol]}
+  (let [{:strs [size iterations files jmx log-dir pid out batch peers inflight protocol
+                hints sync-index]}
         (into {} (map (fn [[k v]] [(str/replace k #"^--" "") v])
                       (partition 2 args)))
         size-k    (keyword (or size "medium"))
@@ -244,6 +262,8 @@
         batch-sz  (parse-long (or batch "200"))
         n-peers   (parse-long (or peers "1"))
         inflight-n (parse-long (or inflight "50"))
+        use-hints (= "true" (or hints "false"))
+        do-sync   (not= "false" (or sync-index "true"))
         ;; Storage protocol the transactor is running. The peer URI must match
         ;; it: a dev:// peer against a sql:// transactor fails with an H2
         ;; connection refusal, because the peer tries to reach H2 directly.
@@ -267,6 +287,7 @@
     (printf "size=%s (%d events, ~%s MB raw)  iterations=%d  batch=%d  peers=%d  inflight/peer=%d  jmx=%s  txor-pid=%d%n"
             (name size-k) n-events (str (get size-raw-mb size-k "?"))
             iters batch-sz n-peers inflight-n jmx-hp txpid)
+    (printf "hints=%s  sync-index=%s%n" use-hints do-sync)
     (printf "files parsed: %s%n" (pr-str fileseq))
     (println "preloading + converting events (excluded from measurement)...")
     (let [t0 (System/nanoTime)
@@ -286,7 +307,9 @@
                                      :ncpu ncpu
                                      :iteration i
                                      :peers n-peers
-                                     :inflight-per-peer inflight-n})]
+                                     :inflight-per-peer inflight-n
+                                     :hints? use-hints
+                                     :sync-index? do-sync})]
                              (report-line r)
                              r)))
             final (last results)]
@@ -330,7 +353,7 @@
                     {:size (name size-k) :events n-events :iterations iters
                      :raw-mb (get size-raw-mb size-k)
                      :batch batch-sz :peers n-peers :inflight-per-peer inflight-n
-                     :protocol proto
+                     :protocol proto :hints use-hints :sync-index do-sync
                      :ncpu ncpu
                      :warmup (vec (butlast results))
                      :final final}))
