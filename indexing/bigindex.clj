@@ -263,6 +263,16 @@
         cycles (atom 0)
         n-ev  (java.util.concurrent.atomic.AtomicLong. 0)
         n-tx  (java.util.concurrent.atomic.AtomicLong. 0)
+        n-bad (java.util.concurrent.atomic.AtomicLong. 0)
+        ;; one malformed event must not end a many-hour run: log the failed
+        ;; transaction, count it, and keep going
+        await! (fn [f]
+                 (try @f
+                      (catch Exception ex
+                        (when (<= (.incrementAndGet n-bad) 10)
+                          (binding [*out* *err*]
+                            (println "tx failed:" (.getMessage (or (.getCause ex) ex)))
+                            (flush))))))
         jobs0 (count (index-jobs logd))
         probe (txor-probe jmxc txpid ncpu)
         t0    (System/nanoTime)
@@ -299,7 +309,7 @@
       (let [item (.poll q 500 TimeUnit/MILLISECONDS)]
         (cond
           (or @stop? (= item END))
-          (doseq [f inf] @f)
+          (run! await! inf)
 
           (nil? item)
           (recur inf)
@@ -313,7 +323,7 @@
                 _ (.incrementAndGet n-tx)
                 inf (conj inf f)]
             (if (>= (count inf) inflight)
-              (do (doseq [x inf] @x) (recur []))
+              (do (run! await! inf) (recur []))
               (recur inf))))))
 
     (reset! stop? true)
@@ -332,8 +342,8 @@
       (printf "  datoms             %,d%n" datoms)
       (when (pos? base)
         (printf "  added              %,d  (on top of %,d)%n" added base))
-      (printf "  events             %,d  (txs %,d, cycles %d)%n"
-              (.get n-ev) (.get n-tx) @cycles)
+      (printf "  events             %,d  (txs %,d, failed %d, cycles %d)%n"
+              (.get n-ev) (.get n-tx) (.get n-bad) @cycles)
       (printf "  wall               %.1f s (%.2f h)%n" (/ load-ms 1000.0) (/ load-ms 3600000.0))
       (printf "  ingest             %,.0f datoms/s%n" (/ (double added) (/ load-ms 1000.0)))
       (printf "  INDEX THROUGHPUT   %,.0f datoms/s  (%d jobs, %,d datoms, %.1f s in-job)%n"
@@ -343,7 +353,7 @@
       (flush)
 
       {:added added
-       :events (.get n-ev) :txs (.get n-tx) :cycles @cycles
+       :events (.get n-ev) :txs (.get n-tx) :failed-txs (.get n-bad) :cycles @cycles
        :load-ms load-ms
        :ingest-datoms-per-sec (/ (double added) (/ load-ms 1000.0))
        :index-jobs (count jobs) :index-datoms j-dat :index-job-ms j-ms

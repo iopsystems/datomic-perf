@@ -49,13 +49,22 @@
     (.setTimeZone f (TimeZone/getTimeZone "UTC"))
     (.parse f s)))
 
+(defn- no-nils
+  "Drop nil-valued attributes: Datomic rejects a nil anywhere in tx-data."
+  [m]
+  (into {} (remove (comp nil? val)) m))
+
 (defn event->tx
   "One GH Archive event -> Datomic tx-data (a vector of maps).
    Nested maps with :db/unique attrs upsert automatically."
   [e]
-  (let [actor  (get e "actor")
-        repo   (get e "repo")
-        org    (get e "org")
+  (let [;; an entity without an id cannot be upserted, and asserting a nil
+        ;; :user/id fails the whole transaction with :db.error/nil-value.
+        ;; GH Archive has such events (seen in Feb-Mar 2024), so drop the ref.
+        has-id #(when (some? (get % "id")) %)
+        actor  (some-> (get e "actor") has-id)
+        repo   (some-> (get e "repo") has-id)
+        org    (some-> (get e "org") has-id)
         pl     (get e "payload")
         etype  (get e "type")
         ev (cond-> {:event/id   (get e "id")
@@ -63,17 +72,17 @@
                     :event/at   (parse-inst (get e "created_at"))}
 
              actor (assoc :event/actor
-                          {:user/id    (get actor "id")
-                           :user/login (get actor "login")})
+                          (no-nils {:user/id    (get actor "id")
+                                    :user/login (get actor "login")}))
 
              repo  (assoc :event/repo
-                          (cond-> {:repo/id   (get repo "id")
-                                   :repo/name (get repo "name")}
-                            org (assoc :repo/org {:org/id    (get org "id")
-                                                  :org/login (get org "login")})))
+                          (cond-> (no-nils {:repo/id   (get repo "id")
+                                            :repo/name (get repo "name")})
+                            org (assoc :repo/org (no-nils {:org/id    (get org "id")
+                                                           :org/login (get org "login")}))))
 
-             org   (assoc :event/org {:org/id    (get org "id")
-                                      :org/login (get org "login")})
+             org   (assoc :event/org (no-nils {:org/id    (get org "id")
+                                                :org/login (get org "login")}))
 
              (get pl "action")
              (assoc :event/action (keyword (get pl "action")))
@@ -88,7 +97,8 @@
              (and (get pl "pull_request") (get-in pl ["pull_request" "number"]))
              (assoc :event/number (long (get-in pl ["pull_request" "number"]))
                     :event/title  (str (get-in pl ["pull_request" "title"]))))]
-    [ev]))
+    ;; without an event id there is nothing to upsert the event onto
+    (if (:event/id ev) [ev] [])))
 
 (defn events-seq
   "Lazy seq of parsed events from a gzipped GH Archive file."
