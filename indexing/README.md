@@ -218,6 +218,80 @@ The preflight checks are sized for the 1B-datom EC2 run. On a host where
 `/mnt/datomic` is a plain directory or the disk is smaller, add
 `-p REQUIRE_MOUNT=false -p MIN_FREE_GIB=20`.
 
+## Data layout on the host
+
+Everything the benchmark reads or writes lives under one root, `R` in
+`indexing.toml` and `ROOT` in `setup-host.sh` (default
+`/mnt/datomic/datomic-bench`). The tree is owned by `systemslab-agent`,
+because the agent runs as its own user and cannot read a normal user's home
+directory.
+
+```
+/mnt/datomic/datomic-bench/
+├── releases/datomic-pro-1.0.7705/     Datomic distribution             (setup: releases)
+│   ├── bin/transactor, bin/datomic      transactor launcher; restore-db / backup-db
+│   └── resources/bench/metrics.clj      metrics callback on the transactor classpath (setup: harness)
+├── gh/                                GH Archive input                  (setup: data)
+│   └── YYYY-MM-DD-H.json.gz             one file per hour, hour not zero-padded
+├── bench/src/bench/*.clj              staged harness source             (setup: harness)
+├── scratch/indexing/                  working directory of the current or last run
+│   ├── data/                            dev (H2) storage: the live database
+│   ├── log/                             transactor log, including :index/create-index lines
+│   ├── bench/                           copy of bench/src + generated deps.edn the peer runs from
+│   ├── p.properties                     transactor config written by the spec
+│   ├── transactor.out, txor.pid, txor.cgroup
+│   ├── bigindex.log, result.json, progress.jsonl, phases.jsonl
+│   └── metrics-transactor.jsonl, metrics-peer.jsonl
+└── backup/<BACKUP_NAME>/              one directory per backup, kept across runs
+    ├── owner, roots/<t>, values/        written by backup-db (roots/ is named by basis t)
+    └── bench-cursor.json                event-stream position, written by the harness
+```
+
+### Inputs: `releases/`, `gh/`, `bench/`
+
+`setup-host.sh` stages these, and runs only read them. Two things to keep in
+mind:
+
+- **Re-stage after harness changes.** The peer runs the copy in
+  `bench/src/bench/`, not your working tree. After editing a `.clj` file, run
+  `./setup-host.sh harness` again.
+- **Don't change `gh/` during a restore chain.** `FILES` (default
+  `*.json.gz`) is a glob over `gh/`. A backup's cursor records the exact file
+  list, so adding or removing archive files makes the next resume fail.
+
+### Run state: `scratch/indexing/`
+
+- **Every run starts clean.** Preflight deletes `scratch/indexing/`, so this
+  directory only ever holds one run: the one in progress, or the last one.
+- **What survives after a run.** The collect step copies the outputs into the
+  experiment's artifacts. The cleanup step then deletes `data/`, the database
+  itself, but leaves everything else for debugging until the next run starts.
+- **Ports.** All runs use the same transactor port (4334) and JMX port (7091),
+  which is one more reason only one run can use a host at a time.
+- **Transactor log size.** `log/` is the transactor's full log. It grows to
+  about 160 MB for a 1M-datom run, so expect it to be large at billion-datom
+  scale.
+
+### Results that persist: `backup/`
+
+- **One directory per backup.** Each backup gets
+  `backup/<BACKUP_NAME>/`, written by `bin/datomic backup-db`.
+- **Overwriting.** A run deletes and rewrites its own `BACKUP_NAME` directory.
+  It refuses to run if that directory is the one it is restoring from.
+- **Nothing is cleaned up.** Backups are kept across runs and nothing deletes
+  them, so remove old ones by hand.
+- **Moving a backup.** `bench-cursor.json` sits next to Datomic's files, so
+  copying the whole directory carries the resume position with it.
+- **No cursor, no resume.** Older backups without `bench-cursor.json` can't be
+  restored by `indexing.toml`.
+
+Approximate sizes on amd for comparison: a 1M-datom backup is about 28 MB, a
+2M-datom one about 55 MB, and 48 hourly archive files take 4.4 GB.
+
+On EC2, `/mnt/datomic` is instance-store NVMe and is wiped by an instance
+stop/start, together with every backup on it. Stage the host again with
+`setup-host.sh` after one.
+
 ## Measurement
 
 ### Indexing throughput
