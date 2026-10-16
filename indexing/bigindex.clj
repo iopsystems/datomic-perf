@@ -11,7 +11,13 @@
 
    After a restore, pass --files that are not in the backup. Replaying files
    the backup already holds upserts onto existing entities and adds almost no
-   datoms.
+   datoms. Alternatively pass the same --files and --order the backup was built
+   with plus --resume true: every backup records how far into the event stream
+   it got (bench-cursor.json in the backup directory), and a resumed load skips
+   that many events before transacting.
+
+   --order asc|desc sets the file order by archive hour (chronological, not
+   by name: hours are not zero-padded); desc loads newest first.
 
    Why this is separate from bench.idxbench: that harness calls preload!, which
    materialises every transaction in the peer heap before timing starts (~0.0157
@@ -100,31 +106,52 @@
                     m ref-id))
           tx)))
 
-(defn- file-events
-  "Lazy seq of parsed events from one .json.gz. Caller must consume fully or
-   accept the reader staying open until GC; we always consume fully."
+(def cursor-file "bench-cursor.json")
+
+(defn archive-key
+  "Chronological sort key for a GH Archive path. Hours are not zero-padded
+   (2024-01-01-9.json.gz), so plain name order puts hour 10 before hour 9."
   [path]
+  (let [n (.getName (io/file ^String path))]
+    (if-let [[_ day hr] (re-find #"^(\d{4}-\d{2}-\d{2})-(\d{1,2})\." n)]
+      [day (parse-long hr) n]
+      [n 0 n])))
+
+(defn- file-events
+  "Lazy seq of parsed events from one .json.gz. The first lines are dropped
+   unparsed while `skip` (a volatile count, shared across files) is positive.
+   Caller must consume fully or accept the reader staying open until GC; we
+   always consume fully."
+  [path skip]
   (let [is (java.io.FileInputStream. ^String path)
         gz (GZIPInputStream. is 262144)
         r  (io/reader gz)]
-    (map #(json/read-str %) (line-seq r))))
+    (map #(json/read-str %)
+         (loop [ls (line-seq r)]
+           (if (and (pos? @skip) (seq ls))
+             (do (vswap! skip dec) (recur (rest ls)))
+             ls)))))
 
 (defn start-producer!
-  "Feed batches of tx-data onto `q` until `stop?` is set. Cycles the file list
-   with an identity offset once exhausted. Returns a future."
-  [q files batch stop? cycles-used]
+  "Feed batches of tx-data onto `q` until `stop?` is set, after skipping the
+   first `skip-events` events of the stream. Cycles the file list with an
+   identity offset once exhausted. Each batch carries the number of source
+   events it came from as {:events n} metadata. Returns a future."
+  [q files batch stop? cycles-used skip-events]
   (future
     (try
-      (loop [cycle-n 0]
+      (loop [cycle-n 0 skip (volatile! skip-events)]
         (when-not @stop?
           (doseq [f files :while (not @stop?)]
-            (let [evs (file-events f)]
+            (let [evs (file-events f skip)]
               (doseq [chunk (partition-all batch evs) :while (not @stop?)]
-                (let [tx (dedupe-tx
-                          (into []
-                                (comp (mapcat gh/event->tx)
-                                      (map #(if (zero? cycle-n) % (offset-event % cycle-n))))
-                                chunk))]
+                (let [tx (with-meta
+                           (dedupe-tx
+                            (into []
+                                  (comp (mapcat gh/event->tx)
+                                        (map #(if (zero? cycle-n) % (offset-event % cycle-n))))
+                                  chunk))
+                           {:events (count chunk)})]
                   ;; block rather than buffer without bound: the queue is the
                   ;; memory ceiling for the whole run
                   (loop []
@@ -135,7 +162,7 @@
           ;; bump this too, so older results over-report cycles by one
           (when-not @stop?
             (reset! cycles-used (inc cycle-n))
-            (recur (inc cycle-n)))))
+            (recur (inc cycle-n) skip))))
       (catch Throwable t
         (binding [*out* *err*] (println "producer error:" (.getMessage t))))
       (finally
@@ -254,7 +281,7 @@
 
 (defn load-phase!
   "Stream GH Archive into `conn` until it holds `base` + `target` datoms."
-  [conn {:keys [files batch inflight qdepth hints? target base sample-ms logd progf]}
+  [conn {:keys [files batch inflight qdepth hints? target base sample-ms logd progf skip-events]}
    jmxc txpid ncpu]
   (printf "%n=== INDEX +%,d datoms (from %,d) ===%n" target base) (flush)
   (let [goal  (+ base target)
@@ -262,6 +289,9 @@
         stop? (atom false)
         cycles (atom 0)
         n-ev  (java.util.concurrent.atomic.AtomicLong. 0)
+        ;; source events behind every submitted tx; skip-events + this is the
+        ;; stream position a later --resume continues from
+        n-src (java.util.concurrent.atomic.AtomicLong. 0)
         n-tx  (java.util.concurrent.atomic.AtomicLong. 0)
         n-bad (java.util.concurrent.atomic.AtomicLong. 0)
         ;; one malformed event must not end a many-hour run: log the failed
@@ -276,7 +306,7 @@
         jobs0 (count (index-jobs logd))
         probe (txor-probe jmxc txpid ncpu)
         t0    (System/nanoTime)
-        prod  (start-producer! q files batch stop? cycles)
+        prod  (start-producer! q files batch stop? cycles skip-events)
 
         ;; progress sampler: datom count is the stop condition, and this is
         ;; also the growth curve we report
@@ -320,6 +350,7 @@
                       (d/transact-async conn item :hints h))
                     (d/transact-async conn item))
                 _ (.addAndGet n-ev (long (count item)))
+                _ (.addAndGet n-src (long (:events (meta item) 0)))
                 _ (.incrementAndGet n-tx)
                 inf (conj inf f)]
             (if (>= (count inf) inflight)
@@ -353,7 +384,7 @@
       (flush)
 
       {:added added
-       :events (.get n-ev) :txs (.get n-tx) :failed-txs (.get n-bad) :cycles @cycles
+       :events (.get n-ev) :source-events (.get n-src) :txs (.get n-tx) :failed-txs (.get n-bad) :cycles @cycles
        :load-ms load-ms
        :ingest-datoms-per-sec (/ (double added) (/ load-ms 1000.0))
        :index-jobs (count jobs) :index-datoms j-dat :index-job-ms j-ms
@@ -411,13 +442,43 @@
     {:exit (:exit r) :backup-ms (:ms r) :tail (:tail r) :bytes sz :jvm dl}))
 
 ;; ---------------------------------------------------------------------------
+;; Phase markers
+;; ---------------------------------------------------------------------------
+
+(defn- now-ms [] (System/currentTimeMillis))
+(defn- iso [ms] (str (java.time.Instant/ofEpochMilli ms)))
+
+(defn phase!
+  "Run `f` as phase `nm`, bracketing it with wall-clock (UTC epoch ms) start
+   and end markers so host metrics recorded alongside (Rezolus) can be cut by
+   phase. Each marker is printed and appended to `phasef` as it happens, so a
+   run that dies mid-phase still leaves its start. The completed record is
+   also conj'd onto `phases`."
+  [phases phasef nm f]
+  (let [mark (fn [m]
+               (spit phasef (str (json/write-str m) "\n") :append true)
+               (printf "PHASE %-11s %-5s %s  (%d)%n" nm (name (:event m))
+                       (iso (:t m)) (:t m))
+               (flush))
+        t0   (now-ms)
+        _    (mark {:phase nm :event :start :t t0})
+        r    (f)
+        t1   (now-ms)]
+    (mark {:phase nm :event :end :t t1})
+    (swap! phases conj {:phase nm :start-ms t0 :end-ms t1
+                        :start (iso t0) :end (iso t1) :duration-ms (- t1 t0)})
+    r))
+
+;; ---------------------------------------------------------------------------
 ;; main
 ;; ---------------------------------------------------------------------------
 
 (defn -main [& args]
   (let [a (into {} (map (fn [[k v]] [(str/replace k #"^--" "") v]) (partition 2 args)))
         target   (parse-long (or (get a "target-datoms") "1000000000"))
-        files    (vec (sort (remove str/blank? (str/split (or (get a "files") "") #","))))
+        order    (or (get a "order") "asc")
+        files    (cond-> (vec (sort-by archive-key (remove str/blank? (str/split (or (get a "files") "") #","))))
+                   (= order "desc") (-> rseq vec))
         batch    (parse-long (or (get a "batch") "1000"))
         inflight (parse-long (or (get a "inflight") "500"))
         qdepth   (parse-long (or (get a "queue") "2000"))
@@ -429,25 +490,58 @@
         restore  (get a "restore-from")
         bdir     (get a "backup-dir")
         hints?   (= "true" (get a "hints" "false"))
+        resume?  (= "true" (get a "resume" "false"))
         final?   (= "true" (get a "final-index" "false"))
         sample   (parse-long (or (get a "sample-ms") "15000"))
         outf     (or (get a "out") "bigindex-result.json")
         progf    (or (get a "progress") "bigindex-progress.jsonl")
+        phasef   (or (get a "phases") "bigindex-phases.jsonl")
+        phases   (atom [])
         ncpu     (.availableProcessors (Runtime/getRuntime))]
 
     (printf "target=+%,d datoms  files=%d  batch=%d  inflight=%d  queue=%d  hints=%s%n"
             target (count files) batch inflight qdepth hints?)
-    (printf "uri=%s  restore-from=%s  backup-dir=%s  final-index=%s%n"
-            uri (or restore "-") (or bdir "-") final?)
+    (printf "uri=%s  restore-from=%s  backup-dir=%s  final-index=%s  order=%s  resume=%s%n"
+            uri (or restore "-") (or bdir "-") final? order resume?)
     (flush)
 
+    (when-not (#{"asc" "desc"} order)
+      (println "FATAL: --order must be asc or desc") (System/exit 1))
     (when (and (pos? target) (empty? files))
       (println "FATAL: --target-datoms > 0 needs --files") (System/exit 1))
     (when (and (or restore bdir) (not dist))
       (println "FATAL: --restore-from and --backup-dir need --dist") (System/exit 1))
+    (when (and resume? (not restore))
+      (println "FATAL: --resume true needs --restore-from") (System/exit 1))
 
+    (let [names (mapv #(.getName (io/file ^String %)) files)
+          _     (when (seq names)
+                  (printf "files: %s .. %s%n" (first names) (peek names)) (flush))
+          ;; Where in the event stream this load starts. --resume takes it from
+          ;; the cursor the backup was written with; the skip is only
+          ;; meaningful against the same files in the same order, so refuse
+          ;; anything else rather than silently replaying or skipping new data.
+          skip  (if resume?
+                  (let [cf (some-> (local-path restore) (io/file cursor-file))
+                        c  (when (and cf (.exists ^java.io.File cf))
+                             (json/read-str (slurp cf) :key-fn keyword))]
+                    (cond
+                      (nil? c)
+                      (do (println "FATAL: --resume: no" cursor-file "in" restore) (System/exit 1))
+                      (not= (:order c) order)
+                      (do (println "FATAL: --resume: backup was built with --order" (:order c)) (System/exit 1))
+                      (not= (:files c) names)
+                      (do (println "FATAL: --resume: --files differ from the backup's"
+                                   (count (:files c)) "files") (System/exit 1))
+                      :else
+                      (do (printf "resume: skipping %,d events already in the backup%n" (:events c))
+                          (flush)
+                          (:events c))))
+                  (parse-long (or (get a "skip-events") "0")))]
     (let [jmxc (jvm/connect jmx-hp)
-          rs   (when restore (restore-phase! dist restore uri jmxc txpid ncpu))
+          ph   (partial phase! phases phasef)
+          _    (spit phasef "")
+          rs   (when restore (ph "restore" #(restore-phase! dist restore uri jmxc txpid ncpu)))
           _    (when-not restore (d/create-database uri))
           conn (d/connect uri)
           ;; a restored database already carries the schema; leave it untouched
@@ -456,19 +550,31 @@
           ;; from 0 exactly as before restore existed
           base (if rs (:datoms rs) 0)
           ld   (when (pos? target)
-                 (load-phase! conn {:files files :batch batch :inflight inflight
-                                    :qdepth qdepth :hints? hints? :target target
-                                    :base base :sample-ms sample :logd logd :progf progf}
-                              jmxc txpid ncpu))
-          fi   (when final? (final-index! conn logd jmxc txpid ncpu))
-          bk   (when bdir (backup-phase! dist uri bdir jmxc txpid ncpu))
+                 (ph "index"
+                     #(load-phase! conn {:files files :batch batch :inflight inflight
+                                         :qdepth qdepth :hints? hints? :target target
+                                         :base base :sample-ms sample :logd logd :progf progf
+                                         :skip-events skip}
+                                   jmxc txpid ncpu)))
+          fi   (when final? (ph "final-index" #(final-index! conn logd jmxc txpid ncpu)))
+          bk   (when bdir (ph "backup" #(backup-phase! dist uri bdir jmxc txpid ncpu)))
+          cursor {:order order :files names
+                  :events (+ skip (or (:source-events ld) 0))}
+          ;; the cursor travels with the backup so a later --resume knows
+          ;; where this database's events end
+          _    (when (and bk (zero? (:exit bk)))
+                 (when-let [p (local-path bdir)]
+                   (spit (io/file p cursor-file) (json/write-str cursor))))
           datoms (:datoms (d/db-stats (d/db conn)))]
 
       (spit outf (json/write-str
                   (merge {:target target :datoms datoms :base-datoms base
-                          :batch batch :inflight inflight :hints hints?}
+                          :batch batch :inflight inflight :hints hints?
+                          :order order :skip-events skip
+                          :cursor-events (:events cursor)}
                          ld
-                         {:restore rs :final-index fi :backup bk})))
+                         {:restore rs :final-index fi :backup bk
+                          :phases @phases})))
       (println "\nwrote" outf)
       (shutdown-agents)
-      (System/exit 0))))
+      (System/exit 0)))))

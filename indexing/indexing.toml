@@ -1,57 +1,66 @@
-# Restore the 1B-datom backup, index more datoms on top of it, then back up
-# again -- timing all three phases.
+# Index GH Archive newest-first, one event per transaction, with optional
+# restore before and backup after -- timing each phase.
 #
-# The backup comes from the billion.toml run (experiment
-# 01a0e761-1a7c-71ca-b6e3-56e19de1c09c): 1,001,052,843 datoms, 16.85 GiB,
-# written in 133.5 s. This spec measures the other direction and what happens
-# next:
+# Design notes (see README.md for the full write-up):
 #
-#   1. restore  bin/datomic restore-db into a fresh dev storage, then a cold
-#               peer connect + db-stats
-#   2. index    +TARGET datoms streamed from GH Archive files NOT in the backup,
-#               then one forced index job (FINAL_INDEX). A load this short may
-#               never reach memory-index-threshold on its own, and the forced
-#               job is the interesting cost: merging new datoms into a
-#               billion-datom durable index.
-#   3. backup   bin/datomic backup-db into a NEW directory (a full backup, not
-#               an incremental one onto the old directory)
+#   * All of ${R}/gh (FILES glob) is used, sorted by archive hour and loaded
+#     in ORDER (desc = newest hour first).
+#   * BATCH=1: every transaction carries exactly one GH event. Throughput then
+#     comes from concurrency instead of batch size: a deep producer QUEUE keeps
+#     parsing ahead, and INFLIGHT transactions are submitted before awaiting.
+#   * Restore resumes where the backup left off. Each backup this spec
+#     writes carries bench-cursor.json (order, file list, events consumed);
+#     with a RESTORE_FROM the load skips that many events, so it continues
+#     with the next-older events instead of upserting ones already present.
+#     The file list and ORDER must match the backup's or the run fails.
 #
-# Which files are new: the 1B run streamed the archive in sorted order and
-# stopped inside January's second (offset) pass, so January 2024 is in the
-# backup and February onward is not. Replaying January would upsert onto
-# existing entities and add almost no datoms.
+# Phases (each optional):
+#   restore  RESTORE_FROM set (empty or "none" starts from a fresh database)
+#   index    TARGET > 0 datoms added in this run; FINAL_INDEX forces a last job
+#   backup   BACKUP_NAME set (empty or "none" skips the backup)
 #
-# INFLIGHT is much lower than the 1B run's 500 on purpose. The harness stops on
-# a datom count sampled every SAMPLE_MS, and 500 in-flight transactions is
-# ~3.3M datoms -- more than the whole 1M target. 20 keeps overshoot to ~130k.
-#
-# Smoke test against the small backup:
-#   systemslab submit restore.toml -p RESTORE_FROM=/mnt/datomic/datomic-bench/backup/smoke \
-#     -p BACKUP_NAME=restore-smoke -p TARGET=50000
+# Examples:
+#   # fresh, 1M datoms, no backup
+#   systemslab submit indexing.toml -p BACKUP_NAME=
+#   # fresh, 1M datoms, backup to backup/idx-1m
+#   systemslab submit indexing.toml -p BACKUP_NAME=idx-1m
+#   # restore idx-1m, +1M datoms, backup to backup/idx-2m
+#   systemslab submit indexing.toml -p RESTORE_FROM=/mnt/datomic/datomic-bench/backup/idx-1m \
+#     -p BACKUP_NAME=idx-2m
 
-name = "datomic-restore-index-backup"
+name = "datomic-indexing"
 
 [params]
 HOST = "datomic.perf"
 R = "/mnt/datomic/datomic-bench"
 RELEASE = "1.0.7705"
-DB = "billion"
-RESTORE_FROM = "/mnt/datomic/datomic-bench/backup/billion"
-BACKUP_NAME = "billion-plus-1m"
-NEW_FILES = "2024-02-*.json.gz"
+DB = "gharchive"
+# Empty or "none" skips the restore phase and starts from a fresh database.
+RESTORE_FROM = ""
+# Written to ${R}/backup/${BACKUP_NAME}. Empty or "none" skips the backup.
+BACKUP_NAME = "indexing"
+FILES = "*.json.gz"
+MIN_FILES = "24"
+ORDER = "desc"
 TARGET = "1000000"
 FINAL_INDEX = "true"
 SAMPLE_MS = "1000"
-BATCH = "1000"
-INFLIGHT = "20"
-QUEUE = "200"
-# Same transactor settings as billion.toml so the restored database is
-# indexed the way it was built.
+# One event per transaction; concurrency comes from QUEUE and INFLIGHT.
+BATCH = "1"
+INFLIGHT = "2000"
+QUEUE = "100000"
+# Transactor settings from the 1B-datom tuning sweep; keep them the same
+# across a restore chain so a restored database is indexed the way it was
+# built.
 MEM_THRESHOLD = "64m"
 MEM_MAX = "2g"
 INDEX_PARALLELISM = "8"
 TXOR_HEAP = "8g"
 PEER_HEAP = "8g"
+# Preflight guards sized for the 1B EC2 run; override for small targets or
+# hosts where /mnt/datomic is a plain directory rather than its own mount.
+REQUIRE_MOUNT = "true"
+MIN_FREE_GIB = "200"
 
 [[jobs]]
 name = "bench"
@@ -69,33 +78,44 @@ JH=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/de
 [ -n "$JH" ] || { echo "FATAL: JDK 21 not found"; ls /usr/lib/jvm/; exit 1; }
 "$JH/bin/java" -version 2>&1 | head -1
 
-mountpoint -q /mnt/datomic || { echo "FATAL: /mnt/datomic not mounted (instance store wiped?)"; exit 1; }
+[ "${REQUIRE_MOUNT}" != "true" ] || mountpoint -q /mnt/datomic || { echo "FATAL: /mnt/datomic not mounted (instance store wiped?)"; exit 1; }
 test -x "${R}/releases/datomic-pro-${RELEASE}/bin/transactor" || { echo "FATAL: no transactor at ${R}/releases/datomic-pro-${RELEASE}"; exit 1; }
-grep -q "restore-from" "${R}/bench/src/bench/bigindex.clj" || { echo "FATAL: staged bigindex.clj has no restore phase"; exit 1; }
+grep -q "bench-cursor" "${R}/bench/src/bench/bigindex.clj" || { echo "FATAL: staged bigindex.clj has no --order/--resume support"; exit 1; }
 
-# The backup to restore. If the instance store was wiped, it can be
-# re-extracted from the tar on the EBS root volume.
-test -f "${RESTORE_FROM}/owner" && test -d "${RESTORE_FROM}/roots" \
-  || { echo "FATAL: no backup at ${RESTORE_FROM} (re-extract /var/datomic-backups/billion-1B-datoms.tar?)"; exit 1; }
-echo "restore from: ${RESTORE_FROM}  ($(du -sh ${RESTORE_FROM} | cut -f1))"
+RF="${RESTORE_FROM}"
+[ "$RF" != "none" ] || RF=""
+BN="${BACKUP_NAME}"
+[ "$BN" != "none" ] || BN=""
+BK=""
+[ -z "$BN" ] || BK="${R}/backup/$BN"
+if [ -n "$RF" ]; then
+  # The backup to restore. On EC2 the instance store is wiped on stop/start,
+  # taking every backup on it with it.
+  test -f "$RF/owner" && test -d "$RF/roots" \
+    || { echo "FATAL: no backup at $RF"; exit 1; }
+  echo "restore from: $RF  ($(du -sh $RF | cut -f1))"
+  test -f "$RF/bench-cursor.json" || { echo "FATAL: $RF has no bench-cursor.json (not written by this spec?)"; exit 1; }
+  echo "cursor: $(cat $RF/bench-cursor.json | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c["order"], len(c["files"]), "files,", c["events"], "events")')"
+  [ "$BK" != "$RF" ] || { echo "FATAL: BACKUP_NAME would overwrite the backup being restored"; exit 1; }
+else
+  echo "restore from: (none) -- indexing into a fresh database"
+fi
 
-BK="${R}/backup/${BACKUP_NAME}"
-[ "$BK" != "${RESTORE_FROM}" ] || { echo "FATAL: BACKUP_NAME would overwrite the backup being restored"; exit 1; }
-
-NF=$(ls ${R}/gh/${NEW_FILES} 2>/dev/null | wc -l)
-echo "new archive files (${NEW_FILES}): $NF"
-[ "$NF" -ge 24 ] || { echo "FATAL: need at least a day of files not in the backup"; exit 1; }
+NF=$(ls ${R}/gh/${FILES} 2>/dev/null | wc -l)
+echo "archive files (${FILES}): $NF  ($(du -shc ${R}/gh/${FILES} | tail -1 | cut -f1)), order ${ORDER}"
+[ "$NF" -ge ${MIN_FILES} ] || { echo "FATAL: only $NF archive files, need >=${MIN_FILES}"; exit 1; }
 
 AVAIL=$(df -BG --output=avail /mnt/datomic | tail -1 | tr -dc '0-9')
 echo "free on /mnt/datomic: ${AVAIL} GiB"
-[ "$AVAIL" -ge 200 ] || { echo "FATAL: need >=200 GiB free, have ${AVAIL}"; exit 1; }
+[ "$AVAIL" -ge ${MIN_FREE_GIB} ] || { echo "FATAL: need >=${MIN_FREE_GIB} GiB free, have ${AVAIL}"; exit 1; }
 
 pkill -9 -x java 2>/dev/null || true
 sleep 3
 pgrep -x java >/dev/null && { echo "FATAL: java still running"; exit 1; } || true
 
-rm -rf "${R}/scratch/restore" "$BK"
-mkdir -p "${R}/scratch/restore/data" "${R}/scratch/restore/log"
+rm -rf "${R}/scratch/indexing"
+[ -z "$BK" ] || rm -rf "$BK"
+mkdir -p "${R}/scratch/indexing/data" "${R}/scratch/indexing/log"
 echo "preflight ok"
 """
 
@@ -105,7 +125,7 @@ type = "shell"
 cgroup = "datomic-transactor"
 command = """
 set -eu
-S=${R}/scratch/restore
+S=${R}/scratch/indexing
 export JAVA_HOME=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/dev/null | head -1)
 export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
 
@@ -152,16 +172,27 @@ type = "shell"
 cgroup = "datomic-peer"
 command = """
 set -eu
-S=${R}/scratch/restore
+S=${R}/scratch/indexing
 export JAVA_HOME=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/dev/null | head -1)
 export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
 PID=$(cat "$S/txor.pid")
 
+# bigindex treats any --restore-from value (even "") as a restore, so omit the
+# flag entirely when building from scratch.
+RF="${RESTORE_FROM}"
+[ "$RF" != "none" ] || RF=""
+RESTORE_ARGS=""
+[ -z "$RF" ] || RESTORE_ARGS="--restore-from $RF --resume true"
+BN="${BACKUP_NAME}"
+[ "$BN" != "none" ] || BN=""
+BACKUP_ARGS=""
+[ -z "$BN" ] || BACKUP_ARGS="--backup-dir ${R}/backup/$BN"
+
 echo "peer cgroup      : $(cat /proc/self/cgroup)"
 echo "transactor cgroup: $(cat $S/txor.cgroup)"
 
-FILES=$(ls ${R}/gh/${NEW_FILES} | sort | paste -sd,)
-echo "files: $(ls ${R}/gh/${NEW_FILES} | wc -l)  (${NEW_FILES})"
+FILE_LIST=$(ls ${R}/gh/${FILES} | sort | paste -sd,)
+echo "files: $(ls ${R}/gh/${FILES} | wc -l)  (${FILES}, order ${ORDER})"
 
 BENCH=$S/bench
 mkdir -p "$BENCH"
@@ -178,19 +209,20 @@ clojure -J-Xmx${PEER_HEAP} -J-server \
   -J-Ddatomic.metricsCallback=bench.metrics/peer \
   -J-Dbench.metrics.peer.out="$S/metrics-peer.jsonl" \
   -M -m bench.bigindex \
-  --restore-from "${RESTORE_FROM}" \
+  $RESTORE_ARGS \
   --target-datoms ${TARGET} \
   --final-index ${FINAL_INDEX} \
   --sample-ms ${SAMPLE_MS} \
-  --files "$FILES" \
+  --files "$FILE_LIST" --order ${ORDER} \
   --batch ${BATCH} --inflight ${INFLIGHT} --queue ${QUEUE} \
   --jmx localhost:7091 --pid "$PID" \
   --log-dir "$S/log" \
   --uri "datomic:dev://localhost:4334/${DB}" \
   --dist "${R}/releases/datomic-pro-${RELEASE}" \
-  --backup-dir "${R}/backup/${BACKUP_NAME}" \
+  $BACKUP_ARGS \
   --out "$S/result.json" \
-  --progress "$S/progress.jsonl" 2>&1 | tee "$S/bigindex.log"
+  --progress "$S/progress.jsonl" \
+  --phases "$S/phases.jsonl" 2>&1 | tee "$S/bigindex.log"
 
 test -s "$S/result.json" || { echo "FATAL: no result.json"; exit 1; }
 """
@@ -200,9 +232,10 @@ test -s "$S/result.json" || { echo "FATAL: no result.json"; exit 1; }
 type = "shell"
 command = """
 set -eu
-S=${R}/scratch/restore
+S=${R}/scratch/indexing
 cp "$S/result.json" result.json
 cp "$S/progress.jsonl" progress.jsonl 2>/dev/null || touch progress.jsonl
+cp "$S/phases.jsonl" phases.jsonl 2>/dev/null || touch phases.jsonl
 cp "$S/bigindex.log" bigindex.log
 cp "$S/transactor.out" transactor.out || true
 grep -h "index/create-index" "$S"/log/*.log > index-jobs.log 2>/dev/null || true
@@ -230,7 +263,7 @@ done
   echo "=== backup restored from ==="
   du -sh "${RESTORE_FROM}" 2>/dev/null || true
   echo "=== new backup ==="
-  du -sh "${R}/backup/${BACKUP_NAME}" 2>/dev/null || true
+  [ -z "${BACKUP_NAME}" ] || [ "${BACKUP_NAME}" = none ] || du -sh "${R}/backup/${BACKUP_NAME}" 2>/dev/null || true
   df -h /mnt/datomic | tail -1
 } > storage.txt
 
@@ -249,7 +282,8 @@ if r:
     print(f"cold connect      {r['connect-ms']/1000:.1f} s, first db-stats {r['first-stats-ms']/1000:.1f} s")
     print(f"restore txor CPU  {cores(r):.2f} cores")
 if d.get('load-ms'):
-    print(f"added             {d['added']:,} datoms  ({d['events']:,} events, {d['txs']:,} txs)")
+    print(f"added             {d['added']:,} datoms  ({d['source-events']:,} events, {d['txs']:,} txs, {d['failed-txs']} failed)")
+    print(f"event stream      order {d['order']}, skipped {d['skip-events']:,}, cursor now {d['cursor-events']:,}")
     print(f"load wall         {d['load-ms']/1000:.1f} s")
     print(f"ingest            {d['ingest-datoms-per-sec']:,.0f} datoms/s")
     print(f"index throughput  {(d.get('index-throughput') or 0):,.0f} datoms/s ({d['index-jobs']} jobs during load)")
@@ -259,6 +293,8 @@ if b:
     print(f"backup latency    {b['backup-ms']/1000:.1f} s ({b['backup-ms']/60000:.2f} min), exit {b['exit']}")
     if b.get('bytes'): print(f"backup size       {b['bytes']/2**30:.2f} GiB  ({b['bytes']/2**20/(b['backup-ms']/1000):.1f} MiB/s)")
 print(f"final datoms      {d['datoms']:,}")
+for p in d.get('phases') or []:
+    print(f"phase {p['phase']:<11} {p['start']} -> {p['end']}  ({p['duration-ms']/1000:.1f} s)")
 PY
 cat storage.txt
 
@@ -277,6 +313,12 @@ path = "result.json"
 [[jobs.steps]]
 type = "upload_artifact"
 path = "progress.jsonl"
+
+# Wall-clock (UTC epoch ms) start/end of each phase, for cutting the host's
+# Rezolus metrics by phase. Also in result.json under "phases".
+[[jobs.steps]]
+type = "upload_artifact"
+path = "phases.jsonl"
 
 [[jobs.steps]]
 type = "upload_artifact"
@@ -312,11 +354,11 @@ type = "shell"
 command = """
 pkill -9 -x java 2>/dev/null || true
 sleep 2
-rm -rf "${R}/scratch/restore/data"
+rm -rf "${R}/scratch/indexing/data"
 df -h /mnt/datomic | tail -1
-echo "cleaned up (backups retained at ${RESTORE_FROM} and ${R}/backup/${BACKUP_NAME})"
+echo "cleaned up (backups retained under ${R}/backup)"
 """
 
 [metadata]
-description = "Restore the 1B-datom backup into fresh dev storage, index 1M more datoms from files not in the backup, force a final index job, then back up to a new directory -- timing each phase"
+description = "Index GH Archive newest-first at one event per transaction (deep queue, many in flight), optionally resuming from a restored backup and backing up after -- timing each phase"
 reference = "bin/datomic restore-db / backup-db; transactor :index/create-index accounting"

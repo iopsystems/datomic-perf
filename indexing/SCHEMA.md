@@ -7,7 +7,7 @@ drive indexing cost.
 
 - Schema: [`gharchive.clj:19-45`](gharchive.clj) (`bench.gharchive/schema`)
 - Event mapping: [`gharchive.clj:52-91`](gharchive.clj) (`event->tx`)
-- Per-transaction dedupe and replay offsets: [`bigindex.clj:35-89`](bigindex.clj)
+- Per-transaction dedupe and replay offsets: [`bigindex.clj:53-107`](bigindex.clj)
 
 ## Entities and attributes
 
@@ -110,7 +110,7 @@ within an hour.
 ```
 
 Larger batches hit this more often, so it used to cap the batch size.
-`dedupe-tx` ([`bigindex.clj:67-89`](bigindex.clj)) keeps the first full map
+`dedupe-tx` ([`bigindex.clj:85-107`](bigindex.clj)) keeps the first full map
 for each identity in a transaction and reduces later mentions to the id alone:
 
 ```clojure
@@ -159,7 +159,7 @@ total time per index job, so that split has not been measured. An A/B run with
 ## Replaying data past the end of the archive
 
 When `bigindex` runs out of archive files before reaching its datom target, it
-replays them with `offset-event` ([`bigindex.clj:35-50`](bigindex.clj)). Each
+replays them with `offset-event` ([`bigindex.clj:53-68`](bigindex.clj)). Each
 replay pass adds `cycle × 1,000,000,000` to every user, repo and org id and
 appends `-c<cycle>` to the event id. Without the offset, replayed events would
 upsert onto the entities from the first pass and the database would stop
