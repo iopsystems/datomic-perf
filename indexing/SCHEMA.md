@@ -99,8 +99,11 @@ not been measured.
 Within one transaction, every map with the same identity value refers to the
 same entity. Because `:user/login` is cardinality-one, two events in one batch
 that give the same user different logins make the transaction invalid. GH
-Archive has this case: GitHub reuses one numeric id across login spellings
-within an hour.
+Archive has this case: when a user or repo is renamed (often only a
+capitalization change), the same numeric id appears under both names within an
+hour. Repo renames are about 10× more common than user renames. See
+[README.md → Transaction conflicts](README.md#transaction-conflicts) for
+measured failure rates by batch size.
 
 ```clojure
 ;; both events in one batch

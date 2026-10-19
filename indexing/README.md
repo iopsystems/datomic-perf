@@ -188,14 +188,86 @@ event ──:event/actor──▶ user
 - **Secondary indexes.** 5 more attributes have `:db/index` (logins, repo name,
   event type, event time), so 9 attributes are in AVET. The 4 ref attributes
   also feed VAET. `:event/title` is `:db/fulltext`, about 2% of datoms.
-- **Conflicting values within a transaction.** GitHub reuses one numeric user
-  id across login spellings, which makes a batched transaction assert two
-  values for one cardinality-one attribute (`:db.error/datoms-conflict`).
-  `dedupe-tx` keeps the first full map per identity in a transaction and
-  reduces later mentions to the id alone. `BATCH=1` cannot hit this.
+- **Conflicting values within a transaction.** See
+  [Transaction conflicts](#transaction-conflicts) below.
 - **Missing ids.** Events without an id are dropped. Actor, repo or org maps
   without an id are left off the event, since a nil identity would fail the
   whole transaction.
+
+### Transaction conflicts
+
+**What causes them.** GH Archive records each user, repo and org with its
+numeric id *and* the name it had when the event happened. When an account or
+repo is renamed, or only its capitalization changes, the same id shows up
+under two names:
+
+```
+user 19433964    oVinayak-MP / vinayakmp007          (2024-01-01, hour 15)
+repo 732652557   GangaTricks/Quiz  15:00:28  →  GangaTricks/quiz  15:25:56
+```
+
+In 2024-01-01 hour 15 (180k events), 9 user ids and 79 repo ids appear with
+two names. Repo renames are by far the most common case.
+
+**Why Datomic rejects it.** `:user/id`, `:repo/id` and `:org/id` are
+`:db.unique/identity`, so within one transaction every map carrying the same id
+resolves to the **same entity**. `:user/login`, `:repo/name` and `:org/login`
+are cardinality-one, so asserting two different values for one entity in one
+transaction is a contradiction. Datomic rejects the **whole** transaction, and
+every event in it is lost:
+
+```
+:db.error/datoms-conflict Two datoms in the same transaction conflict
+{:d1 [17592186045420 :repo/name "GangaTricks/Quiz" 13194139534313 true],
+ :d2 [17592186045420 :repo/name "GangaTricks/quiz" 13194139534313 true]}
+```
+
+The same rename split across two transactions is fine. The second transaction
+retracts the old value and asserts the new one, and the history keeps both. The
+same name repeated in one transaction is also fine, because redundant datoms
+collapse.
+
+| Same id, two names | Result |
+|---|---|
+| in one transaction | `:db.error/datoms-conflict`, the whole tx fails |
+| in two transactions | OK: retract old name, assert new name |
+| in one transaction after `dedupe-tx` | OK: the first name wins for that tx |
+
+**Why batch size matters.** A conflict needs both names inside one
+transaction, and an hour holds about 180k–300k events. So the larger the
+batch, the longer the time window it covers, and the more likely it is to
+contain both sides of a rename. Batching the 48 staged hours (9.6M events)
+without `dedupe-tx`:
+
+| Events per tx | Approx. time per tx | Failed txs | Events lost |
+|---|---|---|---|
+| 1 | — | 0 (impossible) | 0 |
+| 100 | 1–2 s | 3 / 96,211 | 300 (0.003%) |
+| 1,000 | 10–20 s | 5 / 9,622 | 5,000 (0.05%) |
+| 2,000 | 20–40 s | 18 / 4,811 | 36,000 (0.37%) |
+| 5,000 | 1–2 min | 120 / 1,925 | 600,000 (6.2%) |
+| 10,000 | 2–3 min | 325 / 963 | 3,250,000 (33.8%) |
+
+Before `dedupe-tx` existed, this capped how large a batch could be. Even at
+1,000 events per transaction, a long run loses a few whole transactions.
+
+**The fix: `dedupe-tx`.** For each identity, `dedupe-tx` keeps the first full
+map in a transaction and reduces later mentions to the id alone:
+
+```clojure
+{:event/actor {:user/id 1 :user/login "kevinr99089"}}  ; kept in full
+{:event/actor {:user/id 1}}                            ; id only, still upserts
+```
+
+Every event and every reference survives. The later name is dropped only for
+that transaction, and the next transaction that mentions the id updates it.
+With `BATCH=1`, there is only one event per transaction, so conflicts cannot
+happen and `dedupe-tx` has nothing to do.
+
+**Reproducing it.** Transact two maps with the same `:user/id` and different
+`:user/login` in one transaction against a `datomic:mem://` database with the
+schema from `gharchive.clj`. Or batch a real hour with the same rule the table
+above uses: a batch fails if any id appears in it with two different names.
 
 ## Running
 
