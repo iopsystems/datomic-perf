@@ -1,0 +1,382 @@
+# Steady-state transaction rate (TPH) and indexing throughput on top of a
+# restored database.
+#
+#   1. restore   RESTORE_FROM into a fresh dev storage (bin/datomic restore-db)
+#   2. restart   stop the transactor and the peer, start both again, so the
+#                timed load runs against JVMs that loaded the restored index
+#                from storage rather than ones that watched the restore happen
+#   3. warmup    WARMUP_MIN minutes of loading (JIT, caches), not reported as
+#                the result
+#   4. measure   MEASURE_MIN minutes of loading: peer-side tx/s and tx/h,
+#                commit latency, and transactor index-job throughput
+#
+# The load resumes the event stream from the backup's bench-cursor.json, so it
+# adds new events (newest-first, one event per transaction by default) rather
+# than upserting ones already in the database. Warmup and measure share one
+# producer: measure continues exactly where warmup stopped. Every run from the
+# same backup sees the same events, so runs are comparable across settings.
+#
+# Nothing is backed up; the restored database is deleted at the end.
+#
+# Examples:
+#   systemslab submit tph.toml -p HOST=amd -p REQUIRE_MOUNT=false -p MIN_FREE_GIB=20
+#   # write-concurrency sweep
+#   for wc in 4 50 100; do
+#     systemslab submit tph.toml -p HOST=amd -p REQUIRE_MOUNT=false -p MIN_FREE_GIB=20 \
+#       -p WRITE_CONCURRENCY=$wc
+#   done
+
+name = "datomic-tph"
+
+[params]
+HOST = "datomic.perf"
+R = "/mnt/datomic/datomic-bench"
+RELEASE = "1.0.7705"
+DB = "gharchive"
+# A backup written by indexing.toml (it must carry bench-cursor.json). The
+# cursor's file list and ORDER must match FILES and ORDER here.
+RESTORE_FROM = "/mnt/datomic/datomic-bench/backup/idx-10m"
+FILES = "*.json.gz"
+MIN_FILES = "24"
+ORDER = "desc"
+WARMUP_MIN = "5"
+MEASURE_MIN = "30"
+SAMPLE_MS = "5000"
+# One event per transaction; concurrency comes from QUEUE and INFLIGHT.
+BATCH = "1"
+INFLIGHT = "2000"
+QUEUE = "100000"
+# Transactor settings (written to p.properties); same defaults as
+# indexing.toml.
+MEM_THRESHOLD = "1g"
+MEM_MAX = "8g"
+OBJECT_CACHE_MAX = "8g"
+WRITE_CONCURRENCY = "100"
+INDEX_PARALLELISM = "8"
+# Not a Datomic 1.0.7705 property: the transactor accepts it but ignores it.
+INDEX_CPU_PARALLELISM = "8"
+# object-cache-max + memory-index-max must be at most 75% of this heap.
+TXOR_HEAP = "24g"
+PEER_HEAP = "8g"
+REQUIRE_MOUNT = "true"
+MIN_FREE_GIB = "200"
+
+[[jobs]]
+name = "bench"
+tags = ["{HOST}"]
+
+# --- Preflight -------------------------------------------------------------
+[[jobs.steps]]
+type = "shell"
+cgroup = "datomic-transactor"
+command = """
+set -eu
+echo "=== host: $(hostname -s) ==="
+
+JH=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/dev/null | head -1)
+[ -n "$JH" ] || { echo "FATAL: JDK 21 not found"; ls /usr/lib/jvm/; exit 1; }
+"$JH/bin/java" -version 2>&1 | head -1
+
+[ "${REQUIRE_MOUNT}" != "true" ] || mountpoint -q /mnt/datomic || { echo "FATAL: /mnt/datomic not mounted (instance store wiped?)"; exit 1; }
+test -x "${R}/releases/datomic-pro-${RELEASE}/bin/transactor" || { echo "FATAL: no transactor at ${R}/releases/datomic-pro-${RELEASE}"; exit 1; }
+grep -q "measure-ms" "${R}/bench/src/bench/bigindex.clj" || { echo "FATAL: staged bigindex.clj has no --warmup-ms/--measure-ms support"; exit 1; }
+
+RF="${RESTORE_FROM}"
+test -f "$RF/owner" && test -d "$RF/roots" || { echo "FATAL: no backup at $RF"; exit 1; }
+test -f "$RF/bench-cursor.json" || { echo "FATAL: $RF has no bench-cursor.json (not written by indexing.toml?)"; exit 1; }
+echo "restore from: $RF  ($(du -sh $RF | cut -f1))"
+echo "cursor: $(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c["order"], len(c["files"]), "files,", c["events"], "events")' $RF/bench-cursor.json)"
+
+NF=$(ls ${R}/gh/${FILES} 2>/dev/null | wc -l)
+echo "archive files (${FILES}): $NF  ($(du -shc ${R}/gh/${FILES} | tail -1 | cut -f1)), order ${ORDER}"
+[ "$NF" -ge ${MIN_FILES} ] || { echo "FATAL: only $NF archive files, need >=${MIN_FILES}"; exit 1; }
+
+AVAIL=$(df -BG --output=avail /mnt/datomic | tail -1 | tr -dc '0-9')
+echo "free on /mnt/datomic: ${AVAIL} GiB"
+[ "$AVAIL" -ge ${MIN_FREE_GIB} ] || { echo "FATAL: need >=${MIN_FREE_GIB} GiB free, have ${AVAIL}"; exit 1; }
+
+pkill -9 -x java 2>/dev/null || true
+sleep 3
+pgrep -x java >/dev/null && { echo "FATAL: java still running"; exit 1; } || true
+
+S=${R}/scratch/tph
+rm -rf "$S"
+mkdir -p "$S/data" "$S/log" "$S/bench"
+cp -r "${R}/bench/src" "$S/bench/src"
+cat > "$S/bench/deps.edn" <<DEPS
+{:paths ["src"]
+ :deps {com.datomic/peer {:mvn/version "${RELEASE}"}
+        org.clojure/clojure {:mvn/version "1.12.0"}
+        org.clojure/data.json {:mvn/version "2.5.1"}}}
+DEPS
+
+{
+  echo "protocol=dev"
+  echo "host=localhost"
+  echo "port=4334"
+  echo "data-dir=$S/data"
+  echo "log-dir=$S/log"
+  echo "memory-index-threshold=${MEM_THRESHOLD}"
+  echo "memory-index-max=${MEM_MAX}"
+  echo "object-cache-max=${OBJECT_CACHE_MAX}"
+  echo "index-parallelism=${INDEX_PARALLELISM}"
+  echo "index-cpu-parallelism=${INDEX_CPU_PARALLELISM}"
+  echo "write-concurrency=${WRITE_CONCURRENCY}"
+  echo "metrics-callback=bench.metrics/transactor"
+} > "$S/p.properties"
+cat "$S/p.properties"
+
+# Both the first start and the restart run this, so they are identical.
+cat > "$S/start-txor.sh" <<'TXOR'
+#!/bin/bash
+set -eu
+S=$1; DIST=$2; HEAP=$3
+export JAVA_HOME=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/dev/null | head -1)
+export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
+cd "$DIST"
+: > "$S/transactor.out.tmp"
+nohup bin/transactor \
+  -Xmx$HEAP -Xms$HEAP -XX:+UseG1GC -XX:MaxGCPauseMillis=50 \
+  -Ddatomic.prefetchConcurrency=16 \
+  -Dbench.metrics.transactor.out="$S/metrics-transactor.jsonl" \
+  -Dcom.sun.management.jmxremote \
+  -Dcom.sun.management.jmxremote.port=7091 \
+  -Dcom.sun.management.jmxremote.rmi.port=7091 \
+  -Dcom.sun.management.jmxremote.local.only=false \
+  -Dcom.sun.management.jmxremote.authenticate=false \
+  -Dcom.sun.management.jmxremote.ssl=false \
+  -Djava.rmi.server.hostname=127.0.0.1 \
+  "$S/p.properties" > "$S/transactor.out.tmp" 2>&1 &
+for i in $(seq 1 120); do grep -q "System started" "$S/transactor.out.tmp" && break; sleep 1; done
+cat "$S/transactor.out.tmp" >> "$S/transactor.out"
+grep -q "System started" "$S/transactor.out.tmp" || { echo "FATAL: transactor did not start"; tail -30 "$S/transactor.out.tmp"; exit 1; }
+PID=$(pgrep -f datomic.launcher | head -1)
+echo "$PID" > "$S/txor.pid"
+echo "transactor pid=$PID"
+cat /proc/$PID/cgroup > "$S/txor.cgroup"
+TXOR
+chmod +x "$S/start-txor.sh"
+echo "preflight ok"
+"""
+
+# --- Start the transactor --------------------------------------------------
+[[jobs.steps]]
+type = "shell"
+cgroup = "datomic-transactor"
+command = """
+set -eu
+S=${R}/scratch/tph
+"$S/start-txor.sh" "$S" "${R}/releases/datomic-pro-${RELEASE}" ${TXOR_HEAP}
+"""
+
+# --- Restore (peer JVM #1) ---------------------------------------------------
+[[jobs.steps]]
+type = "shell"
+cgroup = "datomic-peer"
+command = """
+set -eu
+S=${R}/scratch/tph
+export JAVA_HOME=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/dev/null | head -1)
+export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
+cd "$S/bench"
+clojure -J-Xmx${PEER_HEAP} -J-Xms${PEER_HEAP} -J-XX:+UseG1GC -J-XX:MaxGCPauseMillis=50 -J-server \
+  -M -m bench.bigindex \
+  --restore-from "${RESTORE_FROM}" \
+  --target-datoms 0 \
+  --jmx localhost:7091 --pid "$(cat $S/txor.pid)" \
+  --log-dir "$S/log" \
+  --uri "datomic:dev://localhost:4334/${DB}" \
+  --dist "${R}/releases/datomic-pro-${RELEASE}" \
+  --out "$S/restore-result.json" \
+  --phases "$S/phases-restore.jsonl" 2>&1 | tee "$S/restore.log"
+test -s "$S/restore-result.json" || { echo "FATAL: restore produced no result"; exit 1; }
+"""
+
+# --- Restart the transactor ---------------------------------------------------
+# The restore's peer JVM has already exited; the timed load starts a new one.
+[[jobs.steps]]
+type = "shell"
+cgroup = "datomic-transactor"
+command = """
+set -eu
+S=${R}/scratch/tph
+mark() { python3 -c 'import json,sys,time; t=int(time.time()*1000); print(json.dumps({"phase":"restart","event":sys.argv[1],"t":t}))' $1 >> "$S/phases-restart.jsonl"; }
+mark start
+OLD=$(cat "$S/txor.pid")
+kill "$OLD"
+for i in $(seq 1 60); do kill -0 "$OLD" 2>/dev/null || break; sleep 1; done
+kill -0 "$OLD" 2>/dev/null && { echo "transactor $OLD did not stop, killing"; kill -9 "$OLD"; sleep 2; }
+"$S/start-txor.sh" "$S" "${R}/releases/datomic-pro-${RELEASE}" ${TXOR_HEAP}
+mark end
+cat "$S/phases-restart.jsonl"
+"""
+
+# --- Warmup + measure (peer JVM #2) -------------------------------------------
+[[jobs.steps]]
+type = "shell"
+cgroup = "datomic-peer"
+command = """
+set -eu
+S=${R}/scratch/tph
+export JAVA_HOME=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/dev/null | head -1)
+export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
+echo "peer cgroup      : $(cat /proc/self/cgroup)"
+echo "transactor cgroup: $(cat $S/txor.cgroup)"
+FILE_LIST=$(ls ${R}/gh/${FILES} | sort | paste -sd,)
+echo "files: $(ls ${R}/gh/${FILES} | wc -l)  (${FILES}, order ${ORDER})"
+cd "$S/bench"
+clojure -J-Xmx${PEER_HEAP} -J-Xms${PEER_HEAP} -J-XX:+UseG1GC -J-XX:MaxGCPauseMillis=50 -J-server \
+  -J-Ddatomic.metricsCallback=bench.metrics/peer \
+  -J-Dbench.metrics.peer.out="$S/metrics-peer.jsonl" \
+  -M -m bench.bigindex \
+  --cursor-from "${RESTORE_FROM}" --resume true \
+  --warmup-ms $((${WARMUP_MIN} * 60000)) --measure-ms $((${MEASURE_MIN} * 60000)) \
+  --final-index false \
+  --sample-ms ${SAMPLE_MS} \
+  --files "$FILE_LIST" --order ${ORDER} \
+  --batch ${BATCH} --inflight ${INFLIGHT} --queue ${QUEUE} \
+  --jmx localhost:7091 --pid "$(cat $S/txor.pid)" \
+  --log-dir "$S/log" \
+  --uri "datomic:dev://localhost:4334/${DB}" \
+  --out "$S/result.json" \
+  --progress "$S/progress.jsonl" \
+  --phases "$S/phases-load.jsonl" 2>&1 | tee "$S/bigindex.log"
+test -s "$S/result.json" || { echo "FATAL: no result.json"; exit 1; }
+"""
+
+# --- Collect ---------------------------------------------------------------
+[[jobs.steps]]
+type = "shell"
+command = """
+set -eu
+S=${R}/scratch/tph
+cp "$S/result.json" result.json
+cp "$S/restore-result.json" restore-result.json
+cp "$S/progress.jsonl" progress.jsonl 2>/dev/null || touch progress.jsonl
+cat "$S/phases-restore.jsonl" "$S/phases-restart.jsonl" "$S/phases-load.jsonl" > phases.jsonl 2>/dev/null || true
+cat "$S/restore.log" "$S/bigindex.log" > bigindex.log
+cp "$S/transactor.out" transactor.out || true
+cp "$S/p.properties" p.properties
+grep -h "index/create-index" "$S"/log/*.log > index-jobs.log 2>/dev/null || true
+grep -h "process-monitor" "$S"/log/*.log > process-monitor.log 2>/dev/null || true
+cp "$S/metrics-transactor.jsonl" metrics-transactor.jsonl 2>/dev/null || true
+touch index-jobs.log process-monitor.log metrics-transactor.jsonl
+
+: > cgroup-cpu.txt
+CGROOT=/sys/fs/cgroup/system.slice/systemslab-agent.service/systemslab
+for cg in datomic-transactor datomic-peer; do
+  d=$(find "$CGROOT" -maxdepth 3 -type d -name "*${cg}*" 2>/dev/null | head -1)
+  if [ -n "$d" ]; then
+    echo "=== $cg ($d)" >> cgroup-cpu.txt
+    for f in cpu.stat memory.peak io.stat; do
+      [ -r "$d/$f" ] && { echo "--- $f"; cat "$d/$f"; } >> cgroup-cpu.txt 2>/dev/null
+    done
+  else
+    echo "=== $cg NOT FOUND" >> cgroup-cpu.txt
+  fi
+done
+
+{
+  echo "=== database after the load ==="
+  du -sh "$S/data" 2>/dev/null || true
+  echo "=== backup restored from ==="
+  du -sh "${RESTORE_FROM}" 2>/dev/null || true
+  df -h /mnt/datomic | tail -1
+} > storage.txt
+
+echo "=== headline ==="
+python3 - <<'PY'
+import json
+d=json.load(open('result.json'))
+r=json.load(open('restore-result.json')).get('restore') or dict()
+cores=lambda p: ((p or dict()).get('jvm') or dict()).get('proc-cpu-cores') or 0
+print(f"restore           {r['restore-ms']/1000:.1f} s, {r['datoms']:,} datoms, exit {r['exit']}")
+print(f"stream            order {d['order']}, skipped {d['skip-events']:,} events, cursor now {d['cursor-events']:,}")
+def show(nm, p):
+    if not p: return
+    lt=p.get('commit-latency') or dict()
+    print(f"{nm:<8} {p['load-ms']/60000:.1f} min  {p['txs']:,} txs ({p['failed-txs']} failed), {p['added']:,} datoms")
+    print(f"  peer            {p['tx-per-sec']:,.0f} tx/s = {p['tx-per-hour']:,.0f} tx/h, {p['ingest-datoms-per-sec']:,.0f} datoms/s")
+    if lt: print(f"  commit latency  p50 {lt['p50-ms']:.1f}  p90 {lt['p90-ms']:.1f}  p99 {lt['p99-ms']:.1f}  max {lt['max-ms']:.1f} ms")
+    it=p.get('index-throughput')
+    print(f"  index jobs      {p['index-jobs']} jobs, {p['index-datoms']:,} datoms, {p['index-job-ms']/1000:.1f} s in-job" + (f" -> {it:,.0f} datoms/s" if it else ""))
+    print(f"  transactor CPU  {cores(p):.2f} cores")
+show("warmup", d.get('warmup'))
+show("measure", d)
+print(f"final datoms      {d['datoms']:,}")
+PY
+python3 - <<'PY'
+import json
+ev=[json.loads(l) for l in open('phases.jsonl') if l.strip()]
+st={}
+for e in ev:
+    if e['event']=='start': st[e['phase']]=e['t']
+    else: print(f"phase {e['phase']:<8} {st.get(e['phase'],0)} -> {e['t']}  ({(e['t']-st.get(e['phase'],e['t']))/1000:.1f} s)")
+PY
+cat storage.txt
+"""
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "result.json"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "restore-result.json"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "progress.jsonl"
+
+# Wall-clock (UTC epoch ms) start/end of restore, restart, warmup and measure,
+# for cutting the host's Rezolus metrics by phase.
+[[jobs.steps]]
+type = "upload_artifact"
+path = "phases.jsonl"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "bigindex.log"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "index-jobs.log"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "process-monitor.log"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "metrics-transactor.jsonl"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "cgroup-cpu.txt"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "storage.txt"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "transactor.out"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "p.properties"
+
+# --- Leave the host clean (the backup is untouched) ---------------------------
+[[jobs.steps]]
+type = "shell"
+command = """
+pkill -9 -x java 2>/dev/null || true
+sleep 2
+rm -rf "${R}/scratch/tph/data"
+df -h /mnt/datomic | tail -1
+echo "cleaned up"
+"""
+
+[metadata]
+description = "Restore a backup, restart transactor and peer, warm up, then measure peer-side transactions per hour and transactor index throughput over a fixed window"
+reference = "bin/datomic restore-db; transactor :index/create-index accounting"

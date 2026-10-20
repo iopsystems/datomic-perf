@@ -49,13 +49,19 @@ SAMPLE_MS = "1000"
 BATCH = "1"
 INFLIGHT = "2000"
 QUEUE = "100000"
-# Transactor settings from the 1B-datom tuning sweep; keep them the same
-# across a restore chain so a restored database is indexed the way it was
-# built.
-MEM_THRESHOLD = "64m"
-MEM_MAX = "2g"
+# Transactor settings (written to p.properties). Keep them the same across a
+# restore chain so a restored database is indexed the way it was built.
+MEM_THRESHOLD = "1g"
+MEM_MAX = "8g"
+OBJECT_CACHE_MAX = "8g"
+WRITE_CONCURRENCY = "100"
 INDEX_PARALLELISM = "8"
-TXOR_HEAP = "8g"
+# Not a Datomic 1.0.7705 property: the transactor accepts it but ignores it.
+INDEX_CPU_PARALLELISM = "8"
+# Datomic refuses to start unless object-cache-max + memory-index-max is at
+# most 75% of the transactor heap: 8g + 8g needs >= 21.4g.
+TXOR_HEAP = "24g"
+# The peer runs with the same G1 settings as the transactor.
 PEER_HEAP = "8g"
 # Preflight guards sized for the 1B EC2 run; override for small targets or
 # hosts where /mnt/datomic is a plain directory rather than its own mount.
@@ -137,9 +143,10 @@ export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
   echo "log-dir=$S/log"
   echo "memory-index-threshold=${MEM_THRESHOLD}"
   echo "memory-index-max=${MEM_MAX}"
-  echo "object-cache-max=2g"
+  echo "object-cache-max=${OBJECT_CACHE_MAX}"
   echo "index-parallelism=${INDEX_PARALLELISM}"
-  echo "write-concurrency=4"
+  echo "index-cpu-parallelism=${INDEX_CPU_PARALLELISM}"
+  echo "write-concurrency=${WRITE_CONCURRENCY}"
   echo "metrics-callback=bench.metrics/transactor"
 } > "$S/p.properties"
 cat "$S/p.properties"
@@ -205,7 +212,7 @@ cat > "$BENCH/deps.edn" <<DEPS
 DEPS
 
 cd "$BENCH"
-clojure -J-Xmx${PEER_HEAP} -J-server \
+clojure -J-Xmx${PEER_HEAP} -J-Xms${PEER_HEAP} -J-XX:+UseG1GC -J-XX:MaxGCPauseMillis=50 -J-server \
   -J-Ddatomic.metricsCallback=bench.metrics/peer \
   -J-Dbench.metrics.peer.out="$S/metrics-peer.jsonl" \
   -M -m bench.bigindex \

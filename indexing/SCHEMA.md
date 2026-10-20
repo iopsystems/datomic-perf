@@ -38,7 +38,7 @@ event ──:event/actor──▶ user
 | `:event/action` | keyword | | payload has `action` (opened, closed, …) |
 | `:event/commits` | long | | `PushEvent` with `payload.size` |
 | `:event/number` | long | | event has an issue or pull request |
-| `:event/title` | string | `:db/fulltext` | event has an issue or pull request |
+| `:event/title` | string | | event has an issue or pull request |
 
 ## Mapping a raw event
 
@@ -133,12 +133,15 @@ error: Datomic retracts the old login and asserts the new one (2 datoms).
 - **VAET:** the 4 ref attributes (`:event/actor`, `:event/repo`,
   `:event/org`, `:repo/org`) are also indexed in reverse, which supports
   "all events by this user/repo" queries.
-- **Fulltext:** `:event/title` is also written to Datomic's Lucene fulltext
-  index, which is eventually consistent.
+- **No fulltext:** `:event/title` used to be `:db/fulltext`, which also wrote
+  it to Datomic's Lucene index. It was dropped so the benchmark measures plain
+  datom indexing only. Backups built before the change (`idx-1m`, `idx-2m`
+  and older) still carry the fulltext attribute: Datomic can't turn
+  `:db/fulltext` off on an existing attribute.
 
-### How much fulltext is in the workload
+### How much text the titles are
 
-Fulltext is a small part of the data. From 14 hourly files (2024-01-01/02,
+Titles are a small part of the data. From 14 hourly files (2024-01-01/02,
 2.53M events):
 
 | Metric | Value |
@@ -153,11 +156,9 @@ Scaled to the 1B run, that is about 22M titles, roughly **2.2% of datoms** and
 under 1 GB of text, against a 125 GB database. These are estimates from a
 holiday sample, which may under-represent pull request activity.
 
-The benchmark therefore mostly measures ordinary datom indexing and upserts.
-Each title does cost more than a plain datom, so fulltext's share of indexing
-time could exceed its 2.2% share of datoms. The transactor log only reports
-total time per index job, so that split has not been measured. An A/B run with
-`:db/fulltext` removed from `:event/title` would measure it directly.
+When titles were fulltext, Lucene's share of indexing time could exceed their
+2.2% share of datoms; that split was never measured. Without fulltext, titles
+are ordinary string datoms.
 
 ## Replaying data past the end of the archive
 

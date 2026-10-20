@@ -41,8 +41,9 @@ benchmark and how to read what it produces.
 | `ORDER` | `desc` | `desc` = newest archive hour first, `asc` = oldest first |
 | `BATCH` / `QUEUE` / `INFLIGHT` | `1` / `100000` / `2000` | Events per tx / producer queue depth (txs) / txs submitted before awaiting |
 | `SAMPLE_MS` | `1000` | Datom-count sampling period, which is also the stop check |
-| `MEM_THRESHOLD`, `MEM_MAX`, `INDEX_PARALLELISM` | `64m`, `2g`, `8` | Transactor indexing settings |
-| `TXOR_HEAP`, `PEER_HEAP` | `8g`, `8g` | JVM heaps |
+| `MEM_THRESHOLD`, `MEM_MAX`, `OBJECT_CACHE_MAX` | `1g`, `8g`, `8g` | Transactor memory index and cache. `OBJECT_CACHE_MAX + MEM_MAX` must be ≤ 75% of `TXOR_HEAP` or the transactor won't start |
+| `WRITE_CONCURRENCY`, `INDEX_PARALLELISM`, `INDEX_CPU_PARALLELISM` | `100`, `8`, `8` | Transactor concurrency. `index-cpu-parallelism` is ignored by Datomic 1.0.7705 |
+| `TXOR_HEAP`, `PEER_HEAP` | `24g`, `8g` | JVM heaps; both use `-Xms = -Xmx`, G1, `MaxGCPauseMillis=50` |
 | `DB`, `RELEASE`, `R` | `gharchive`, `1.0.7705`, `/mnt/datomic/datomic-bench` | Database name, Datomic release, staging root |
 | `REQUIRE_MOUNT`, `MIN_FREE_GIB`, `MIN_FILES` | `true`, `200`, `24` | Preflight guards |
 
@@ -74,6 +75,36 @@ systemslab $U submit indexing.toml $SMALL \
   It fails on purpose if `ORDER` or the file list (`FILES` glob over `gh/`)
   differs from what the backup was built with. Do not add or remove archive
   files between chained runs.
+
+## Steady-state TPH (`tph.toml`)
+
+Restore a backup → restart transactor and peer → warm up → measure for a fixed
+time. See README "Steady-state transaction rate".
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `RESTORE_FROM` | `.../backup/idx-10m` | Backup written by `indexing.toml` (needs `bench-cursor.json`) |
+| `WARMUP_MIN`, `MEASURE_MIN` | `5`, `30` | Minutes of loading before and during the measured window |
+| `SAMPLE_MS` | `5000` | Progress sampling only; the stop is time-based |
+| Others | as `indexing.toml` | `BATCH`, `INFLIGHT`, `QUEUE`, transactor settings, heaps, guards. No `TARGET`, `BACKUP_NAME` or `FINAL_INDEX` |
+
+```bash
+# write-concurrency sweep; submit sequentially (one run per host at a time)
+for wc in 4 50 100; do
+  systemslab $U submit tph.toml $SMALL -p WRITE_CONCURRENCY=$wc
+done
+```
+
+- **Headline numbers** are top-level in `result.json` and are the *measure*
+  window: `tx-per-sec`, `tx-per-hour`, `ingest-datoms-per-sec`,
+  `commit-latency`, `index-jobs`/`index-throughput`, `jvm`. The warmup's
+  numbers are under `warmup`; the restore's are in `restore-result.json`.
+- **Phases** in `phases.jsonl`: `restore`, `restart`, `warmup`, `measure`.
+  Use the `measure` start/end to cut Rezolus.
+- **Compare like with like.** Runs are comparable only from the same
+  backup, `FILES` and `ORDER` (then they load the same events).
+- **Commit latency is mostly queueing:** with `INFLIGHT=2000`, p50 is roughly
+  2000 ÷ tx/s. Compare it across runs, not as the cost of one transaction.
 
 Wait for a run to finish:
 
@@ -195,10 +226,11 @@ metrics exist, see the `rezolus-query` skill (`describe_metrics`).
   `index-throughput` is the cost per datom inside background index jobs. They
   answer different questions, so don't compare them as if they were the same
   measure.
-- **Few index jobs on short loads.** A 1M load usually triggers only 1 index
-  job (the memory-index threshold is `MEM_THRESHOLD=64m`), so
-  `index-throughput` rests on one sample. For merge cost, also read
-  `final-index`.
+- **No index jobs on short loads.** With `MEM_THRESHOLD=1g`, a 1M load
+  never reaches the threshold: `index-jobs` is 0 and `index-throughput` is
+  null, and all indexing happens in `final-index` (1 job over ~1M datoms on
+  amd). Read `final-index` for indexing cost at this scale; background-job
+  throughput needs a much larger load.
 - **`final-index.ms` vs phase duration.** The `final-index` phase duration is
   about 5 s longer than its `ms`. The harness waits that long for the job's
   log line, so the tail of that phase is idle.

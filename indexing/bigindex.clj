@@ -9,6 +9,15 @@
                  --final-index true then forces and times one last index job.
      3. backup   --backup-dir DIR: bin/datomic backup-db.
 
+   Instead of a datom target, --measure-ms M loads for a fixed time: an
+   optional --warmup-ms W phase first, then a measure phase of M ms. Both
+   phases share one producer, so the measure phase continues the event stream
+   exactly where warmup stopped. Each reports peer-side transactions per
+   second/hour and commit latency alongside the usual index accounting.
+
+   --cursor-from DIR resumes from DIR's bench-cursor.json without restoring:
+   for a database restored by an earlier process (e.g. before a JVM restart).
+
    After a restore, pass --files that are not in the backup. Replaying files
    the backup already holds upserts onto existing entities and adds almost no
    datoms. Alternatively pass the same --files and --order the backup was built
@@ -164,7 +173,9 @@
             (reset! cycles-used (inc cycle-n))
             (recur (inc cycle-n) skip))))
       (catch Throwable t
-        (binding [*out* *err*] (println "producer error:" (.getMessage t))))
+        ;; a stop (future-cancel) interrupts a blocked read; only report real errors
+        (when-not (or @stop? (instance? InterruptedException t))
+          (binding [*out* *err*] (println "producer error:" (.getMessage t)))))
       (finally
         ;; unblock every consumer
         (dotimes [_ 64] (.offer q END 1 TimeUnit/SECONDS))))))
@@ -279,15 +290,56 @@
 ;; Phase 2: index
 ;; ---------------------------------------------------------------------------
 
+;; Commit latency, peer side: submit (transact-async) to the future completing.
+;; Log-scale buckets 1% wide from 1 us to well past 100 s, so percentiles are
+;; within 1% and recording is one atomic increment.
+(def ^:private lat-base (Math/log 1.01))
+(def ^:private lat-buckets 2400)
+
+(defn- lat-hist [] (java.util.concurrent.atomic.AtomicLongArray. (int lat-buckets)))
+
+(defn- lat-record! [^java.util.concurrent.atomic.AtomicLongArray h nanos]
+  (let [us (max 1.0 (/ (double nanos) 1000.0))
+        i  (min (dec lat-buckets) (long (/ (Math/log us) lat-base)))]
+    (.incrementAndGet h (int i))))
+
+(defn- lat-summary
+  "Percentiles in ms from a latency histogram."
+  [^java.util.concurrent.atomic.AtomicLongArray h]
+  (let [cs (mapv #(.get h (int %)) (range lat-buckets))
+        n  (reduce + cs)
+        at (fn [q] (let [want (* q n)]
+                     (loop [i 0 acc 0]
+                       (let [acc (+ acc (cs i))]
+                         (if (or (>= acc want) (= i (dec lat-buckets)))
+                           (/ (Math/pow 1.01 (+ i 0.5)) 1000.0)
+                           (recur (inc i) acc))))))]
+    (when (pos? n)
+      {:count n :p50-ms (at 0.5) :p90-ms (at 0.9) :p99-ms (at 0.99)
+       :p999-ms (at 0.999) :max-ms (at 1.0)})))
+
+(def ^:private direct-executor
+  (reify java.util.concurrent.Executor (execute [_ r] (.run ^Runnable r))))
+
 (defn load-phase!
-  "Stream GH Archive into `conn` until it holds `base` + `target` datoms."
-  [conn {:keys [files batch inflight qdepth hints? target base sample-ms logd progf skip-events]}
+  "Stream GH Archive into `conn` until it holds `base` + `target` datoms, or
+   for `duration-ms` when that is set. With `src` ({:q :cycles} of a producer
+   started by the caller) the phase reads that producer's queue and leaves it
+   running, so a following phase picks up the stream where this one stopped;
+   otherwise it starts and stops its own producer."
+  [conn {:keys [label files batch inflight qdepth hints? target base sample-ms logd progf
+                skip-events duration-ms src]}
    jmxc txpid ncpu]
-  (printf "%n=== INDEX +%,d datoms (from %,d) ===%n" target base) (flush)
-  (let [goal  (+ base target)
-        q     (ArrayBlockingQueue. qdepth)
+  (if duration-ms
+    (printf "%n=== %s %.1f min (from %,d datoms) ===%n" (str/upper-case (or label "index"))
+            (/ duration-ms 60000.0) base)
+    (printf "%n=== INDEX +%,d datoms (from %,d) ===%n" target base))
+  (flush)
+  (let [goal  (if target (+ base target) Long/MAX_VALUE)
+        q     (if src (:q src) (ArrayBlockingQueue. (int qdepth)))
         stop? (atom false)
-        cycles (atom 0)
+        cycles (if src (:cycles src) (atom 0))
+        lat   (lat-hist)
         n-ev  (java.util.concurrent.atomic.AtomicLong. 0)
         ;; source events behind every submitted tx; skip-events + this is the
         ;; stream position a later --resume continues from
@@ -306,12 +358,13 @@
         jobs0 (count (index-jobs logd))
         probe (txor-probe jmxc txpid ncpu)
         t0    (System/nanoTime)
-        prod  (start-producer! q files batch stop? cycles skip-events)
+        deadline (when duration-ms (+ t0 (* (long duration-ms) 1000000)))
+        prod  (when-not src (start-producer! q files batch stop? cycles skip-events))
 
         ;; progress sampler: datom count is the stop condition, and this is
         ;; also the growth curve we report
         sampler (future
-                  (with-open [w (io/writer progf)]
+                  (with-open [w (io/writer progf :append (boolean src))]
                     (loop []
                       (Thread/sleep (long sample-ms))
                       (let [db (d/db conn)
@@ -320,6 +373,7 @@
                             rate (/ (double (- n base)) (max 0.001 (/ el 1000.0)))]
                         (.write w (json/write-str
                                    {:t (System/currentTimeMillis)
+                                    :phase (or label "index")
                                     :elapsed-s (/ el 1000.0)
                                     :datoms n
                                     :added (- n base)
@@ -328,38 +382,47 @@
                                     :cycles @cycles
                                     :datoms-per-sec rate}))
                         (.write w "\n") (.flush w)
-                        (printf "  [%6.0fs] datoms=%,d  added=%,d  events=%,d  %,.0f datoms/s  cycles=%d%n"
-                                (/ el 1000.0) n (- n base) (.get n-ev) rate @cycles)
+                        (printf "  [%6.0fs] datoms=%,d  added=%,d  events=%,d  txs=%,d  %,.0f datoms/s  cycles=%d%n"
+                                (/ el 1000.0) n (- n base) (.get n-ev) (.get n-tx) rate @cycles)
                         (flush)
-                        (when (>= n goal) (reset! stop? true))
+                        (when (or (>= n goal) (and deadline (>= (System/nanoTime) deadline)))
+                          (reset! stop? true))
                         (when-not @stop? (recur))))))]
 
-    ;; consumer
+    ;; consumer. Check for stop before polling, not after: an item taken off
+    ;; the queue is always transacted, so a shared producer's stream has no gap
+    ;; between phases and the cursor counts exactly what was transacted.
     (loop [inf []]
-      (let [item (.poll q 500 TimeUnit/MILLISECONDS)]
+      (if (or @stop? (and deadline (>= (System/nanoTime) deadline)))
+        (do (reset! stop? true) (run! await! inf))
+        (let [item (.poll q 500 TimeUnit/MILLISECONDS)]
         (cond
-          (or @stop? (= item END))
+          (= item END)
           (run! await! inf)
 
           (nil? item)
           (recur inf)
 
           :else
-          (let [f (if hints?
+          (let [ts (System/nanoTime)
+                f (if hints?
                     (let [h (:hints (d/with (d/db conn) item :return-hints true))]
                       (d/transact-async conn item :hints h))
                     (d/transact-async conn item))
+                _ (.addListener ^datomic.ListenableFuture f
+                                #(lat-record! lat (- (System/nanoTime) ts))
+                                direct-executor)
                 _ (.addAndGet n-ev (long (count item)))
                 _ (.addAndGet n-src (long (:events (meta item) 0)))
                 _ (.incrementAndGet n-tx)
                 inf (conj inf f)]
             (if (>= (count inf) inflight)
               (do (run! await! inf) (recur []))
-              (recur inf))))))
+              (recur inf)))))))
 
     (reset! stop? true)
     (try @sampler (catch Exception _ nil))
-    (future-cancel prod)
+    (when prod (future-cancel prod))
 
     (let [load-ms (ms (- (System/nanoTime) t0))
           dl      (probe)
@@ -367,9 +430,12 @@
           added   (- datoms base)
           jobs    (drop jobs0 (index-jobs logd))
           j-dat   (reduce + 0 (map :datoms jobs))
-          j-ms    (reduce + 0.0 (map :msec jobs))]
+          j-ms    (reduce + 0.0 (map :msec jobs))
+          ok-txs  (- (.get n-tx) (.get n-bad))
+          tx-s    (/ (double ok-txs) (/ load-ms 1000.0))
+          lt      (lat-summary lat)]
 
-      (printf "%n=== LOAD COMPLETE ===%n")
+      (printf "%n=== %s COMPLETE ===%n" (str/upper-case (or label "load")))
       (printf "  datoms             %,d%n" datoms)
       (when (pos? base)
         (printf "  added              %,d  (on top of %,d)%n" added base))
@@ -377,6 +443,10 @@
               (.get n-ev) (.get n-tx) (.get n-bad) @cycles)
       (printf "  wall               %.1f s (%.2f h)%n" (/ load-ms 1000.0) (/ load-ms 3600000.0))
       (printf "  ingest             %,.0f datoms/s%n" (/ (double added) (/ load-ms 1000.0)))
+      (printf "  peer txs           %,.0f tx/s  (%,.0f tx/h)%n" tx-s (* tx-s 3600.0))
+      (when lt
+        (printf "  commit latency     p50 %.1f  p90 %.1f  p99 %.1f  p99.9 %.1f  max %.1f ms%n"
+                (:p50-ms lt) (:p90-ms lt) (:p99-ms lt) (:p999-ms lt) (:max-ms lt)))
       (printf "  INDEX THROUGHPUT   %,.0f datoms/s  (%d jobs, %,d datoms, %.1f s in-job)%n"
               (if (pos? j-ms) (/ j-dat (/ j-ms 1000.0)) 0.0)
               (count jobs) j-dat (/ j-ms 1000.0))
@@ -387,6 +457,7 @@
        :events (.get n-ev) :source-events (.get n-src) :txs (.get n-tx) :failed-txs (.get n-bad) :cycles @cycles
        :load-ms load-ms
        :ingest-datoms-per-sec (/ (double added) (/ load-ms 1000.0))
+       :tx-per-sec tx-s :tx-per-hour (* tx-s 3600.0) :commit-latency lt
        :index-jobs (count jobs) :index-datoms j-dat :index-job-ms j-ms
        :index-throughput (when (pos? j-ms) (/ j-dat (/ j-ms 1000.0)))
        :jvm dl})))
@@ -491,6 +562,11 @@
         bdir     (get a "backup-dir")
         hints?   (= "true" (get a "hints" "false"))
         resume?  (= "true" (get a "resume" "false"))
+        ;; where --resume reads the cursor: the restored backup by default
+        cursor-d (or (get a "cursor-from") restore)
+        warmup   (parse-long (or (get a "warmup-ms") "0"))
+        measure  (parse-long (or (get a "measure-ms") "0"))
+        timed?   (pos? measure)
         final?   (= "true" (get a "final-index" "false"))
         sample   (parse-long (or (get a "sample-ms") "15000"))
         outf     (or (get a "out") "bigindex-result.json")
@@ -499,20 +575,23 @@
         phases   (atom [])
         ncpu     (.availableProcessors (Runtime/getRuntime))]
 
-    (printf "target=+%,d datoms  files=%d  batch=%d  inflight=%d  queue=%d  hints=%s%n"
-            target (count files) batch inflight qdepth hints?)
+    (if timed?
+      (printf "warmup=%.1f min  measure=%.1f min  files=%d  batch=%d  inflight=%d  queue=%d  hints=%s%n"
+              (/ warmup 60000.0) (/ measure 60000.0) (count files) batch inflight qdepth hints?)
+      (printf "target=+%,d datoms  files=%d  batch=%d  inflight=%d  queue=%d  hints=%s%n"
+              target (count files) batch inflight qdepth hints?))
     (printf "uri=%s  restore-from=%s  backup-dir=%s  final-index=%s  order=%s  resume=%s%n"
             uri (or restore "-") (or bdir "-") final? order resume?)
     (flush)
 
     (when-not (#{"asc" "desc"} order)
       (println "FATAL: --order must be asc or desc") (System/exit 1))
-    (when (and (pos? target) (empty? files))
-      (println "FATAL: --target-datoms > 0 needs --files") (System/exit 1))
+    (when (and (or timed? (pos? target)) (empty? files))
+      (println "FATAL: loading needs --files") (System/exit 1))
     (when (and (or restore bdir) (not dist))
       (println "FATAL: --restore-from and --backup-dir need --dist") (System/exit 1))
-    (when (and resume? (not restore))
-      (println "FATAL: --resume true needs --restore-from") (System/exit 1))
+    (when (and resume? (not cursor-d))
+      (println "FATAL: --resume true needs --restore-from or --cursor-from") (System/exit 1))
 
     (let [names (mapv #(.getName (io/file ^String %)) files)
           _     (when (seq names)
@@ -522,19 +601,19 @@
           ;; meaningful against the same files in the same order, so refuse
           ;; anything else rather than silently replaying or skipping new data.
           skip  (if resume?
-                  (let [cf (some-> (local-path restore) (io/file cursor-file))
+                  (let [cf (some-> (local-path cursor-d) (io/file cursor-file))
                         c  (when (and cf (.exists ^java.io.File cf))
                              (json/read-str (slurp cf) :key-fn keyword))]
                     (cond
                       (nil? c)
-                      (do (println "FATAL: --resume: no" cursor-file "in" restore) (System/exit 1))
+                      (do (println "FATAL: --resume: no" cursor-file "in" cursor-d) (System/exit 1))
                       (not= (:order c) order)
                       (do (println "FATAL: --resume: backup was built with --order" (:order c)) (System/exit 1))
                       (not= (:files c) names)
                       (do (println "FATAL: --resume: --files differ from the backup's"
                                    (count (:files c)) "files") (System/exit 1))
                       :else
-                      (do (printf "resume: skipping %,d events already in the backup%n" (:events c))
+                      (do (printf "resume: skipping %,d events already in %s%n" (:events c) cursor-d)
                           (flush)
                           (:events c))))
                   (parse-long (or (get a "skip-events") "0")))]
@@ -542,20 +621,43 @@
           ph   (partial phase! phases phasef)
           _    (spit phasef "")
           rs   (when restore (ph "restore" #(restore-phase! dist restore uri jmxc txpid ncpu)))
-          _    (when-not restore (d/create-database uri))
+          ;; true only if the database did not exist: a restored one, or one
+          ;; restored by an earlier process, already carries its schema
+          new? (and (not restore) (d/create-database uri))
           conn (d/connect uri)
-          ;; a restored database already carries the schema; leave it untouched
-          _    (when-not restore @(d/transact conn gh/schema))
+          _    (when new? @(d/transact conn gh/schema))
           ;; target counts datoms added in this run, so a fresh run measures
           ;; from 0 exactly as before restore existed
-          base (if rs (:datoms rs) 0)
-          ld   (when (pos? target)
-                 (ph "index"
-                     #(load-phase! conn {:files files :batch batch :inflight inflight
-                                         :qdepth qdepth :hints? hints? :target target
-                                         :base base :sample-ms sample :logd logd :progf progf
-                                         :skip-events skip}
-                                   jmxc txpid ncpu)))
+          base (cond rs (:datoms rs) new? 0 :else (:datoms (d/db-stats (d/db conn))))
+          _    (when-not (or rs new?) (printf "existing database: %,d datoms%n" base) (flush))
+          opts {:files files :batch batch :inflight inflight :qdepth qdepth :hints? hints?
+                :sample-ms sample :logd logd :progf progf :skip-events skip}
+          ;; timed mode: one producer feeds warmup then measure
+          [wu ld]
+          (cond
+            timed?
+            (let [q    (ArrayBlockingQueue. (int qdepth))
+                  pst? (atom false)
+                  cyc  (atom 0)
+                  prod (start-producer! q files batch pst? cyc skip)
+                  src  {:q q :cycles cyc}
+                  now  #(:datoms (d/db-stats (d/db conn)))
+                  wu   (when (pos? warmup)
+                         (ph "warmup" #(load-phase! conn (assoc opts :label "warmup" :base (now)
+                                                               :duration-ms warmup :src src)
+                                                    jmxc txpid ncpu)))
+                  ld   (ph "measure" #(load-phase! conn (assoc opts :label "measure" :base (now)
+                                                             :duration-ms measure :src src)
+                                                  jmxc txpid ncpu))]
+              (reset! pst? true)
+              (future-cancel prod)
+              [wu (assoc ld :source-events (+ (:source-events ld) (or (:source-events wu) 0)))])
+
+            (pos? target)
+            [nil (ph "index" #(load-phase! conn (assoc opts :target target :base base)
+                                           jmxc txpid ncpu))]
+
+            :else [nil nil])
           fi   (when final? (ph "final-index" #(final-index! conn logd jmxc txpid ncpu)))
           bk   (when bdir (ph "backup" #(backup-phase! dist uri bdir jmxc txpid ncpu)))
           cursor {:order order :files names
@@ -572,8 +674,10 @@
                           :batch batch :inflight inflight :hints hints?
                           :order order :skip-events skip
                           :cursor-events (:events cursor)}
-                         ld
-                         {:restore rs :final-index fi :backup bk
+                         (dissoc ld :source-events)
+                         {:source-events (:source-events ld)
+                          :warmup-ms warmup :measure-ms measure
+                          :warmup wu :restore rs :final-index fi :backup bk
                           :phases @phases})))
       (println "\nwrote" outf)
       (shutdown-agents)

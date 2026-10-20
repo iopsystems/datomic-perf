@@ -42,7 +42,8 @@
    {:db/ident :event/commits :db/valueType :db.type/long   :db/cardinality :db.cardinality/one}
    ;; Issue/PR detail
    {:db/ident :event/number  :db/valueType :db.type/long   :db/cardinality :db.cardinality/one}
-   {:db/ident :event/title   :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/fulltext true}])
+   ;; no :db/fulltext: the benchmark measures plain datom indexing, not Lucene
+   {:db/ident :event/title   :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
 
 (defn parse-inst ^java.util.Date [s]
   (let [f (SimpleDateFormat. "yyyy-MM-dd'T'HH:mm:ss'Z'")]
@@ -274,12 +275,6 @@
                     [?e :event/at ?t]
                     [(>= ?t ?lo)] [(< ?t ?hi)]]
                   db lo hi)))]
-
-   ;; --- fulltext ---
-   ["G13 fulltext search issue/PR titles" 10 100
-    (fn [] (d/q '[:find ?title :in $ ?q :where
-                  [(fulltext $ :event/title ?q) [[?e ?title]]]]
-                db "fix"))]
 
    ;; --- raw index scan (engine-overhead comparison) ---
    ["G14 raw AEVT scan :event/type" 3 20

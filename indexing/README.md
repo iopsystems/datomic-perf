@@ -10,6 +10,7 @@ This benchmark measures how fast a Datomic Pro transactor ingests and indexes
 | [`jvmstats.clj`](jvmstats.clj) | JMX and `/proc` snapshots of the transactor |
 | [`metrics.clj`](metrics.clj) | Datomic metrics callback for the transactor and peer |
 | [`indexing.toml`](indexing.toml) | The Systemslab spec: newest-first, one event per transaction, every phase optional |
+| [`tph.toml`](tph.toml) | Steady-state spec: restore a backup, restart both JVMs, warm up, then measure transactions per hour for a fixed time |
 | [`setup-host.sh`](setup-host.sh) | Stage a host: JDK, Clojure, Datomic release, GH Archive, harness |
 | [`SCHEMA.md`](SCHEMA.md) | Schema details and their indexing cost |
 
@@ -62,8 +63,9 @@ database starts with. The load stops once the datom count reaches
 `base + TARGET`, where `base` is the restored datom count, or 0 for a fresh
 database. For example, a restore of 1,028,835 datoms with `TARGET=1000000`
 loads until at least 2,028,835 datoms. Every added datom is indexed, either by
-a job during the load or by the forced final index. In that run, the three
-index jobs covered exactly the 1,035,471 datoms added. Restored datoms are
+a job during the load or by the forced final index. In that run (with the
+earlier 64m memory-index threshold), the three index jobs covered exactly the
+1,035,471 datoms added. Restored datoms are
 already in the durable index and are not indexed again.
 
 ### Resuming the event stream
@@ -86,8 +88,9 @@ without `--resume` and pass `--files` the backup never saw.
 
 ### Final index
 
-A short load on top of a large database may never reach
-`memory-index-threshold`, so no index job runs during it. Without a forced
+A short load may never reach `memory-index-threshold`, so no index job runs
+during it. With the default `MEM_THRESHOLD=1g`, a 1M-datom load is one of
+these: every datom is indexed by the final job. Without a forced
 job, the run would measure ingest only, not the cost of merging new datoms
 into the large durable index. `final-index` calls `d/request-index` followed by
 `d/sync-index` and times both. It then waits 5 s so the job's log line lands
@@ -187,7 +190,8 @@ event ──:event/actor──▶ user
   per event.
 - **Secondary indexes.** 5 more attributes have `:db/index` (logins, repo name,
   event type, event time), so 9 attributes are in AVET. The 4 ref attributes
-  also feed VAET. `:event/title` is `:db/fulltext`, about 2% of datoms.
+  also feed VAET. No attribute is `:db/fulltext` (`:event/title` was until
+  it was dropped; see [SCHEMA.md](SCHEMA.md)).
 - **Conflicting values within a transaction.** See
   [Transaction conflicts](#transaction-conflicts) below.
 - **Missing ids.** Events without an id are dropped. Actor, repo or org maps
@@ -269,6 +273,93 @@ happen and `dedupe-tx` has nothing to do.
 schema from `gharchive.clj`. Or batch a real hour with the same rule the table
 above uses: a batch fails if any id appears in it with two different names.
 
+## Steady-state transaction rate: `tph.toml`
+
+`indexing.toml` answers "how long does it take to add N datoms". `tph.toml`
+answers "how many transactions per hour does a warm system sustain on top of
+an existing database", and how fast the transactor indexes meanwhile.
+
+| Step | What happens |
+|---|---|
+| **restore** | Peer JVM #1 runs `bin/datomic restore-db` of `RESTORE_FROM` (default `backup/idx-10m`) into fresh dev storage, then exits |
+| **restart** | The transactor is stopped and started again with the same `p.properties` and heap |
+| **warmup** | Peer JVM #2 resumes the event stream from the backup's cursor and loads for `WARMUP_MIN` (5) minutes: JIT, caches and the memory index fill up |
+| **measure** | The same JVM loads for `MEASURE_MIN` (30) more minutes; this window is the result |
+
+- **Why restart.** Without it, the measured transactor would be the one that
+  served the restore, with whatever that left in its heap and caches.
+  Restarting both JVMs makes the measured system one that started on an
+  existing database and loaded its index from storage.
+- **One stream across warmup and measure.** Both phases read from one producer,
+  so measure starts at exactly the event warmup stopped at. Nothing is
+  skipped or replayed between them.
+- **Same events every run.** Every run restores the same backup and resumes at
+  the same cursor, so runs that differ only in a setting (e.g.
+  `WRITE_CONCURRENCY`) load the same events.
+- **Nothing is backed up.** The grown database is deleted at the end.
+
+What the measure phase reports (`result.json`, top level; warmup's own numbers
+are under `warmup`):
+
+| Field | Meaning |
+|---|---|
+| `tx-per-sec`, `tx-per-hour` | Transactions that committed, divided by the window (peer side). With `BATCH=1` a transaction is one GH event |
+| `ingest-datoms-per-sec` | Datoms added in the window ÷ window |
+| `commit-latency` | p50/p90/p99/p99.9/max ms from `transact-async` to the future completing, on 1%-wide buckets |
+| `index-jobs`, `index-datoms`, `index-throughput` | Transactor index jobs whose log line landed in the window, and Σdatoms ÷ Σmsec over them |
+| `jvm` | Transactor JVM and `/proc` deltas over the window |
+
+Commit latency includes the time a transaction waits in the transactor's
+queue behind the other in-flight ones, so with `INFLIGHT=2000` it mostly
+reflects queue depth ÷ throughput, not the cost of one transaction.
+
+An index job is counted in the window its log line lands in, so a job that
+started in warmup and finished in measure counts fully in measure.
+
+**Event budget.** At ~7k tx/s a 35-minute run uses ~15M events. The 96 hours
+staged on amd (2024-01-01, 2024-01-29, 2024-01-30, 2024-02-01) hold 21.1M
+events, of which `idx-10m` used the first 1.2M, so a run stays on real events
+up to about 9.5k tx/s. Past that the producer replays the files with offset
+ids (`cycles` > 0 in `result.json`).
+
+**Disk per run.** At ~60k datoms/s the database grows by roughly 120M datoms
+in 35 minutes. The transactor log grows with the transaction count (about
+155 MB per 1M datoms at `BATCH=1`), so expect tens of GB in
+`scratch/tph/log` per run. The next run's preflight deletes it.
+
+```bash
+# one run, defaults (restore idx-10m, 5 + 30 min)
+systemslab submit tph.toml -p HOST=amd -p REQUIRE_MOUNT=false -p MIN_FREE_GIB=20
+# write-concurrency sweep
+for wc in 4 50 100; do
+  systemslab submit tph.toml -p HOST=amd -p REQUIRE_MOUNT=false -p MIN_FREE_GIB=20 \
+    -p WRITE_CONCURRENCY=$wc
+done
+```
+
+`RESTORE_FROM` must be a backup written by `indexing.toml` (it needs
+`bench-cursor.json`), and `FILES`/`ORDER` must match the ones it was built
+with.
+
+### Results on amd: `WRITE_CONCURRENCY` sweep
+
+`idx-10m` restored, 5 + 30 min, `BATCH=1`, `INFLIGHT=2000`, other settings
+at their defaults. Measure window only; one run per setting.
+
+| `WRITE_CONCURRENCY` | tx/s | tx/h | datoms/s | index throughput | commit p50 / p99 | transactor CPU |
+|---|---|---|---|---|---|---|
+| 4 | 7,061 | 25.4M | 55,941 | 151,613 datoms/s (13 jobs) | 87 / 164 ms | 6.3 cores |
+| 50 | 6,883 | 24.8M | 54,557 | 156,795 datoms/s (13 jobs) | 89 / 169 ms | 6.2 cores |
+| 100 | 6,836 | 24.6M | 54,194 | 154,358 datoms/s (13 jobs) | 90 / 170 ms | 6.2 cores |
+
+Write concurrency makes no measurable difference: the spread is about 3%, within
+what one run per setting can resolve. The transactor's own metrics
+(`metrics-transactor.jsonl`) show why. `TransactionApplyMsec` averages
+0.13 ms per transaction, and summed over a second it reaches 0.93 s in every
+run: the transactor applies transactions one at a time, and that step is
+93% busy, capping the rate near 1 ÷ 0.13 ms ≈ 7.5k tx/s. Storage writes
+are only ~2.6 MB/s, so a limit on concurrent writes has nothing to throttle.
+
 ## Running
 
 Stage the host once, then submit `indexing.toml`. Everything lives under
@@ -343,6 +434,10 @@ mind:
 - **Transactor log size.** `log/` is the transactor's full log. It grows to
   about 160 MB for a 1M-datom run, so expect it to be large at billion-datom
   scale.
+- **`scratch/tph/`.** `tph.toml` uses its own directory with the same layout,
+  plus `start-txor.sh` (used for both transactor starts), `restore.log` and
+  `restore-result.json` from the restore's peer JVM, and one `phases-*.jsonl`
+  per step. Its preflight deletes it and its cleanup deletes `data/`.
 
 ### Results that persist: `backup/`
 
@@ -358,7 +453,12 @@ mind:
   restored by `indexing.toml`.
 
 Approximate sizes on amd for comparison: a 1M-datom backup is about 28 MB, a
-2M-datom one about 55 MB, and 48 hourly archive files take 4.4 GB.
+2M-datom one about 55 MB, and the 10M-datom `idx-10m` 248 MB (all
+`BATCH=1`). The 96 hourly archive files take 9.4 GB.
+
+Adding the 2024-01-29 and 2024-01-30 files changed the file list, so backups
+whose cursor recorded the older 48-file list (`idx-1m`, `idx-2m`) can no
+longer be resumed.
 
 On EC2, `/mnt/datomic` is instance-store NVMe and is wiped by an instance
 stop/start, together with every backup on it. Stage the host again with
