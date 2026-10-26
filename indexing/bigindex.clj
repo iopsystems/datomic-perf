@@ -141,17 +141,78 @@
              (do (vswap! skip dec) (recur (rest ls)))
              ls)))))
 
+(def ^:private counts-file ".line-counts.json")
+
+(defn- count-lines
+  "Events in one .json.gz: newline bytes in the decompressed stream, without
+   building strings or parsing JSON."
+  [^String path]
+  (with-open [gz (GZIPInputStream. (java.io.FileInputStream. path) 262144)]
+    (let [^bytes buf (byte-array 1048576)]
+      (loop [n 0]
+        (let [k (.read gz buf)]
+          (if (neg? k)
+            n
+            (recur (loop [i 0 n n]
+                     (if (< i k)
+                       (recur (inc i) (if (== 10 (aget buf i)) (inc n) n))
+                       n)))))))))
+
+(defn- line-counts
+  "Event counts of the leading files of `files`, in order, until they cover
+   more than `skip` events (or all files). Counts are cached in
+   .line-counts.json beside the files, keyed by name and checked against the
+   file size, so only the first resume over a file list reads them."
+  [files skip]
+  (let [cf    (io/file (.getParentFile (io/file ^String (first files))) counts-file)
+        cache (try (json/read-str (slurp cf)) (catch Exception _ {}))
+        ncpu  (.availableProcessors (Runtime/getRuntime))
+        one   (fn [f] (let [fl (io/file ^String f) nm (.getName fl) sz (.length fl)
+                            e  (get cache nm)]
+                        [nm sz (if (= sz (get e "size")) (get e "lines") (count-lines f))]))]
+    (loop [fs files acc [] total 0]
+      (if (or (empty? fs) (> total skip))
+        (do (try (spit cf (json/write-str
+                           (into cache (map (fn [[nm sz n]] [nm {"size" sz "lines" n}])) acc)))
+                 (catch Exception _ nil))
+            (mapv #(nth % 2) acc))
+        (let [chunk (take (* 2 ncpu) fs)
+              cs    (vec (pmap one chunk))]
+          (recur (drop (count chunk) fs) (into acc cs) (+ total (reduce + (map #(nth % 2) cs)))))))))
+
+(defn skip-plan
+  "Where a stream that skips its first `skip` events starts: {:drop-files k
+   :skip-lines r} drops k whole files unread and skips r lines of the next.
+   Skipping line by line costs ~10 s per million events (minutes to tens of
+   minutes at billions of datoms), so whole files are skipped by count. A skip
+   past the end of the file list falls back to line skipping."
+  [files skip]
+  (if (or (zero? skip) (empty? files))
+    {:drop-files 0 :skip-lines skip}
+    (let [t0 (System/nanoTime)
+          cs (line-counts files skip)
+          k  (count (take-while #(<= % skip) (reductions + cs)))
+          r  (- skip (reduce + 0 (take k cs)))
+          p  (if (and (= k (count files)) (pos? r))
+               {:drop-files 0 :skip-lines skip}
+               {:drop-files k :skip-lines r})]
+      (printf "resume: %,d events = %d whole files + %,d lines (planned in %.1f s)%n"
+              skip (:drop-files p) (:skip-lines p) (/ (- (System/nanoTime) t0) 1e9))
+      (flush)
+      p)))
+
 (defn start-producer!
-  "Feed batches of tx-data onto `q` until `stop?` is set, after skipping the
-   first `skip-events` events of the stream. Cycles the file list with an
-   identity offset once exhausted. Each batch carries the number of source
-   events it came from as {:events n} metadata. Returns a future."
-  [q files batch stop? cycles-used skip-events]
+  "Feed batches of tx-data onto `q` until `stop?` is set, starting where
+   `start` (a skip-plan) says. Cycles the file list with an identity offset
+   once exhausted. Each batch carries the number of source events it came from
+   as {:events n} metadata. Returns a future."
+  [q files batch stop? cycles-used start]
   (future
     (try
-      (loop [cycle-n 0 skip (volatile! skip-events)]
+      (loop [cycle-n 0 skip (volatile! (:skip-lines start 0))]
         (when-not @stop?
-          (doseq [f files :while (not @stop?)]
+          (doseq [f (if (zero? cycle-n) (drop (:drop-files start 0) files) files)
+                  :while (not @stop?)]
             (let [evs (file-events f skip)]
               (doseq [chunk (partition-all batch evs) :while (not @stop?)]
                 (let [tx (with-meta
@@ -242,6 +303,49 @@
       (jvm/delta j0 (jvm/snapshot jmxc) h0 (jvm/host-snapshot txpid)
                  (ms (- (System/nanoTime) t0)) ncpu))))
 
+(defn- start-thread-sampler!
+  "Every `every-ms`, append one line to `path`: CPU each transactor thread used
+   since the previous line (idle threads left out), with its Java thread id
+   (the :tid in Datomic's log), name, state and Linux thread id. Linux ids come
+   from jcmd, which pauses the JVM, so it runs only when unmapped threads have
+   appeared and at most once per `map-ms` (0 = never); each line records how
+   long that call took. Returns a fn that stops the sampler and waits for it."
+  [jmxc txpid every-ms map-ms path]
+  (let [tb    (jvm/thread-bean jmxc)
+        jcmd  (str (System/getProperty "java.home") "/bin/jcmd")
+        stop? (atom false)
+        f (future
+            (try
+              (with-open [w (io/writer path :append true)]
+                (loop [prev (jvm/thread-sample tb) t-prev (System/currentTimeMillis)
+                       nids {} t-map 0]
+                  (Thread/sleep (long every-ms))
+                  (let [cur  (jvm/thread-sample tb)
+                        now  (System/currentTimeMillis)
+                        new? (some #(not (contains? nids %)) (keys cur))
+                        map? (and new? (pos? map-ms) (pos? txpid) (>= (- now t-map) map-ms))
+                        t0   (System/nanoTime)
+                        nids (if map? (merge nids (jvm/os-thread-ids jcmd txpid)) nids)
+                        j-ms (when map? (ms (- (System/nanoTime) t0)))
+                        rows (for [[id c] cur
+                                   :let [p  (get prev id)
+                                         dc (- (:cpu-ns c) (:cpu-ns p 0))]
+                                   :when (pos? dc)]
+                               {:id id :nid (get nids id) :name (:name c) :state (:state c)
+                                :cpu-ms (/ dc 1e6)
+                                :user-ms (/ (- (:user-ns c) (:user-ns p 0)) 1e6)})]
+                    (.write w (json/write-str
+                               (cond-> {:t now :interval-ms (- now t-prev)
+                                        :live (count cur)
+                                        :threads (vec (sort-by (comp - :cpu-ms) rows))}
+                                 map? (assoc :jcmd-ms j-ms))))
+                    (.write w "\n") (.flush w)
+                    (when-not @stop?
+                      (recur cur now nids (if map? now t-map))))))
+              (catch Exception e
+                (binding [*out* *err*] (println "thread sampler stopped:" (.getMessage e))))))]
+    (fn [] (reset! stop? true) (deref f (+ every-ms 30000) nil))))
+
 ;; ---------------------------------------------------------------------------
 ;; Phase 1: restore
 ;; ---------------------------------------------------------------------------
@@ -328,7 +432,7 @@
    running, so a following phase picks up the stream where this one stopped;
    otherwise it starts and stops its own producer."
   [conn {:keys [label files batch inflight qdepth hints? target base sample-ms logd progf
-                skip-events duration-ms src]}
+                start duration-ms src]}
    jmxc txpid ncpu]
   (if duration-ms
     (printf "%n=== %s %.1f min (from %,d datoms) ===%n" (str/upper-case (or label "index"))
@@ -359,7 +463,7 @@
         probe (txor-probe jmxc txpid ncpu)
         t0    (System/nanoTime)
         deadline (when duration-ms (+ t0 (* (long duration-ms) 1000000)))
-        prod  (when-not src (start-producer! q files batch stop? cycles skip-events))
+        prod  (when-not src (start-producer! q files batch stop? cycles start))
 
         ;; progress sampler: datom count is the stop condition, and this is
         ;; also the growth curve we report
@@ -572,6 +676,10 @@
         outf     (or (get a "out") "bigindex-result.json")
         progf    (or (get a "progress") "bigindex-progress.jsonl")
         phasef   (or (get a "phases") "bigindex-phases.jsonl")
+        ;; per-thread transactor CPU; off unless --threads names a file
+        threadf  (get a "threads")
+        thread-ms (parse-long (or (get a "thread-ms") "5000"))
+        tmap-ms  (parse-long (or (get a "thread-map-ms") "30000"))
         phases   (atom [])
         ncpu     (.availableProcessors (Runtime/getRuntime))]
 
@@ -620,6 +728,10 @@
     (let [jmxc (jvm/connect jmx-hp)
           ph   (partial phase! phases phasef)
           _    (spit phasef "")
+          stop-threads! (if threadf
+                          (do (spit threadf "")
+                              (start-thread-sampler! jmxc txpid thread-ms tmap-ms threadf))
+                          (constantly nil))
           rs   (when restore (ph "restore" #(restore-phase! dist restore uri jmxc txpid ncpu)))
           ;; true only if the database did not exist: a restored one, or one
           ;; restored by an earlier process, already carries its schema
@@ -630,8 +742,11 @@
           ;; from 0 exactly as before restore existed
           base (cond rs (:datoms rs) new? 0 :else (:datoms (d/db-stats (d/db conn))))
           _    (when-not (or rs new?) (printf "existing database: %,d datoms%n" base) (flush))
+          ;; plan the resume before any phase starts, so counting files (once
+          ;; per file list, then cached) is never inside a timed window
+          start (when (or timed? (pos? target)) (skip-plan files skip))
           opts {:files files :batch batch :inflight inflight :qdepth qdepth :hints? hints?
-                :sample-ms sample :logd logd :progf progf :skip-events skip}
+                :sample-ms sample :logd logd :progf progf :start start}
           ;; timed mode: one producer feeds warmup then measure
           [wu ld]
           (cond
@@ -639,8 +754,14 @@
             (let [q    (ArrayBlockingQueue. (int qdepth))
                   pst? (atom false)
                   cyc  (atom 0)
-                  prod (start-producer! q files batch pst? cyc skip)
+                  prod (start-producer! q files batch pst? cyc start)
                   src  {:q q :cycles cyc}
+                  ;; the warmup clock starts once the producer has work ready
+                  t0   (System/nanoTime)
+                  _    (loop [] (when (and (nil? (.peek q)) (not (future-done? prod)))
+                                  (Thread/sleep 100) (recur)))
+                  _    (do (printf "producer ready after %.1f s%n" (/ (- (System/nanoTime) t0) 1e9))
+                           (flush))
                   now  #(:datoms (d/db-stats (d/db conn)))
                   wu   (when (pos? warmup)
                          (ph "warmup" #(load-phase! conn (assoc opts :label "warmup" :base (now)
@@ -669,6 +790,7 @@
                    (spit (io/file p cursor-file) (json/write-str cursor))))
           datoms (:datoms (d/db-stats (d/db conn)))]
 
+      (stop-threads!)
       (spit outf (json/write-str
                   (merge {:target target :datoms datoms :base-datoms base
                           :batch batch :inflight inflight :hints hints?

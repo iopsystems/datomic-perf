@@ -163,7 +163,10 @@ step_deps() {
         org.clojure/clojure {:mvn/version "1.12.0"}
         org.clojure/data.json {:mvn/version "2.5.1"}}}
 DEPS
-    sudo -u "$AGENT_USER" HOME="$AGENT_HOME" sh -c "cd '$tmp' && clojure -P" \
+    # sudo resets PATH to secure_path, which on Rocky/RHEL omits /usr/local/bin
+    # where the Clojure installer puts `clojure`
+    sudo -u "$AGENT_USER" HOME="$AGENT_HOME" PATH="/usr/local/bin:/usr/bin:/bin" \
+      sh -c "cd '$tmp' && clojure -P" \
       && echo "  peer $v: OK" || { echo "  peer $v: FAILED"; exit 1; }
   done
   sudo rm -rf "$tmp"

@@ -309,9 +309,10 @@ are under `warmup`):
 | `index-jobs`, `index-datoms`, `index-throughput` | Transactor index jobs whose log line landed in the window, and Σdatoms ÷ Σmsec over them |
 | `jvm` | Transactor JVM and `/proc` deltas over the window |
 
-Commit latency includes the time a transaction waits in the transactor's
-queue behind the other in-flight ones, so with `INFLIGHT=2000` it mostly
-reflects queue depth ÷ throughput, not the cost of one transaction.
+Commit latency includes the time a transaction waits behind the other
+outstanding ones, so it mostly reflects queueing, not the cost of one
+transaction. About 600–750 transactions are outstanding at once whatever
+`INFLIGHT` is (see the `INFLIGHT` sweep below).
 
 An index job is counted in the window its log line lands in, so a job that
 started in warmup and finished in measure counts fully in measure.
@@ -323,9 +324,11 @@ up to about 9.5k tx/s. Past that the producer replays the files with offset
 ids (`cycles` > 0 in `result.json`).
 
 **Disk per run.** At ~60k datoms/s the database grows by roughly 120M datoms
-in 35 minutes. The transactor log grows with the transaction count (about
-155 MB per 1M datoms at `BATCH=1`), so expect tens of GB in
-`scratch/tph/log` per run. The next run's preflight deletes it.
+in 35 minutes. The transactor log stays small: by default the specs set the
+two per-transaction loggers (`datomic.transaction`, `datomic.kv-cluster`) to
+WARN. With `TX_LOG=true` and `STORAGE_LOG=true` the log grows by about 1.3 KB
+per transaction, tens of GB in `scratch/tph/log` per run, and the next run's
+preflight deletes it.
 
 ```bash
 # one run, defaults (restore idx-10m, 5 + 30 min)
@@ -357,8 +360,34 @@ what one run per setting can resolve. The transactor's own metrics
 (`metrics-transactor.jsonl`) show why. `TransactionApplyMsec` averages
 0.13 ms per transaction, and summed over a second it reaches 0.93 s in every
 run: the transactor applies transactions one at a time, and that step is
-93% busy, capping the rate near 1 ÷ 0.13 ms ≈ 7.5k tx/s. Storage writes
+93% busy, capping the rate near 1 ÷ 0.13 ms ≈ 7.5k tx/s. Per-thread CPU
+during a measure window agrees: the transactor's `processor-gharchive`
+thread runs at ~95% of one core, while no peer thread exceeds ~35%, so
+neither the producer nor the consumer is the limit. Storage writes
 are only ~2.6 MB/s, so a limit on concurrent writes has nothing to throttle.
+
+### Results on amd: `INFLIGHT` sweep
+
+Same setup, `WRITE_CONCURRENCY=100`. The 2000 row is a second run of the
+default, which gives the run-to-run spread (6,783 vs 6,836 tx/s, under 1%).
+
+| `INFLIGHT` | tx/s | tx/h | datoms/s | index throughput | commit p50 / p99 |
+|---|---|---|---|---|---|
+| 2,000 | 6,783 | 24.4M | 53,771 | 158,471 datoms/s (13 jobs) | 90 / 170 ms |
+| 20,000 | 6,899 | 24.8M | 54,677 | 152,222 datoms/s (12 jobs) | 109 / 181 ms |
+| 200,000 | 6,889 | 24.8M | 54,607 | 148,863 datoms/s (12 jobs) | 110 / 188 ms |
+
+More transactions in flight don't raise the rate: 2,000 already keeps the
+transactor's transaction thread saturated. Commit latency also barely grows
+(90 → 110 ms), although with 200,000 truly outstanding it would be ~29 s. By
+Little's law only about 600–750 transactions are outstanding (p50 × tx/s) at
+any setting. The latency clock starts before `transact-async` is called, so
+the explanation is that `transact-async` itself blocks the consumer once
+roughly that many are outstanding, and each call waits only ~0.15 ms for the
+next slot to free up. The consumer thread used ~7% CPU, consistent with it
+spending most of its time blocked. So `INFLIGHT` above ~750 only delays the
+group barrier; it adds no work in flight. The cap is inferred from these
+measurements, not from Datomic documentation.
 
 ## Running
 

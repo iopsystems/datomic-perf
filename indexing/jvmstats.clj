@@ -8,7 +8,8 @@
    index merges we care about happen elsewhere. Everything here therefore
    targets a PID we are given, not our own runtime."
   (:require [clojure.string :as str]
-            [clojure.java.io :as io])
+            [clojure.java.io :as io]
+            [clojure.java.shell])
   (:import [javax.management.remote JMXConnectorFactory JMXServiceURL]
            [javax.management ObjectName]
            [java.lang.management ManagementFactory]))
@@ -44,6 +45,14 @@
      :gc-count   (reduce + 0 (keep :count per))
      :gc-ms      (reduce + 0 (keep :ms per))}))
 
+(defn pause-collector?
+  "True for collector beans whose CollectionTime is stop-the-world pause time:
+   G1's Young/Old Generation and ZGC's Minor/Major Pauses. ZGC's Cycles beans
+   time concurrent work, and G1 Concurrent GC is left out to match, so summing
+   these is comparable across the two collectors where gc-ms is not."
+  [^String n]
+  (boolean (and n (re-find #"Pauses$|Young Generation$|Old Generation$" n))))
+
 (defn jit-stats
   "JIT compilation time (ms). Cumulative since JVM start."
   [conn]
@@ -71,6 +80,44 @@
   "One full sample of the remote JVM."
   [conn]
   (merge (gc-stats conn) (jit-stats conn) (mem-stats conn) (proc-stats conn)))
+
+;; ---------------------------------------------------------------------------
+;; Per-thread CPU
+;; ---------------------------------------------------------------------------
+
+(defn thread-bean
+  "Proxy for the remote JVM's ThreadMXBean. The com.sun.management extension
+   reads CPU time for many threads in one call."
+  ^com.sun.management.ThreadMXBean [conn]
+  (ManagementFactory/newPlatformMXBeanProxy
+   conn ManagementFactory/THREAD_MXBEAN_NAME com.sun.management.ThreadMXBean))
+
+(defn thread-sample
+  "{java-thread-id {:name :state :cpu-ns :user-ns}} for every live thread.
+   CPU times are cumulative since each thread started. Reading them does not
+   stop the JVM."
+  [^com.sun.management.ThreadMXBean tb]
+  (let [ids  (.getAllThreadIds tb)
+        cpu  (.getThreadCpuTime tb ids)
+        usr  (.getThreadUserTime tb ids)
+        info (.getThreadInfo tb ids 0)]
+    (into {} (for [i (range (alength ids))
+                   :let [^java.lang.management.ThreadInfo ti (aget info i)]
+                   :when (and ti (pos? (aget cpu i)))]
+               [(aget ids i) {:name   (.getThreadName ti)
+                              :state  (str (.getThreadState ti))
+                              :cpu-ns (aget cpu i)
+                              :user-ns (aget usr i)}]))))
+
+(defn os-thread-ids
+  "Java thread id -> Linux thread id, parsed from the `jcmd <pid> Thread.print`
+   headers, e.g. \"name\" #108 [37650] daemon prio=5 ... (JDK 19+). jcmd stops
+   the JVM at a safepoint while it walks every stack, so call it sparingly."
+  [jcmd pid]
+  (let [{:keys [out exit]} (clojure.java.shell/sh jcmd (str pid) "Thread.print")]
+    (when (zero? exit)
+      (into {} (for [[_ jid nid] (re-seq #"(?m)^\".*\" #(\d+) \[(\d+)\]" out)]
+                 [(parse-long jid) (parse-long nid)])))))
 
 ;; ---------------------------------------------------------------------------
 ;; Host-level: /proc CPU + per-process IO
@@ -151,11 +198,22 @@
         ci      (- (get-in host-after [:cpu :idle])  (get-in host-before [:cpu :idle]))
         ciow    (- (get-in host-after [:cpu :iowait]) (get-in host-before [:cpu :iowait]))
         rb      (d (:io host-before) (:io host-after) :read_bytes)
-        wb      (d (:io host-before) (:io host-after) :write_bytes)]
+        wb      (d (:io host-before) (:io host-after) :write_bytes)
+        ;; per collector; :collectors keeps bean order between snapshots
+        colls   (into {} (for [[a b] (map vector (:collectors before) (:collectors after))
+                               :when (and (= (:name a) (:name b)) (:ms a) (:ms b))]
+                           [(:name b) {:count (- (:count b) (:count a))
+                                       :ms    (- (:ms b) (:ms a))}]))
+        pause-ms (reduce + 0 (for [[n c] colls :when (pause-collector? n)] (:ms c)))]
     {:wall-ms          wall-ms
      :gc-count         gc-n
+     ;; every collector bean, so under ZGC this includes concurrent cycle time;
+     ;; :gc-pause-ms is the figure to compare across collectors
      :gc-ms            gc-ms
      :gc-pct           (when (and gc-ms (pos? wall-ms)) (* 100.0 (/ gc-ms wall-ms)))
+     :gc-pause-ms      pause-ms
+     :gc-pause-pct     (when (pos? wall-ms) (* 100.0 (/ pause-ms wall-ms)))
+     :gc-collectors    colls
      :jit-ms           jit-ms
      :jit-pct          (when (and jit-ms (pos? wall-ms)) (* 100.0 (/ jit-ms wall-ms)))
      ;; transactor CPU as a fraction of ONE core, and of the whole box

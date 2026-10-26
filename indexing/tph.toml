@@ -58,6 +58,23 @@ INDEX_CPU_PARALLELISM = "8"
 # object-cache-max + memory-index-max must be at most 75% of this heap.
 TXOR_HEAP = "24g"
 PEER_HEAP = "8g"
+# Per-transaction transactor log events, off by default. Together they add
+# about 1.3 KB of log per transaction (9 GB for a 30-minute tph run).
+#   TX_LOG       datomic.transaction :tx/process: apply time, index reads and
+#                a per-step apply breakdown for every transaction
+#   STORAGE_LOG  datomic.kv-cluster: begin/end of every storage write; the
+#                LogWriteMsec and PodUpdateMsec metrics cover the same timing
+TX_LOG = "false"
+STORAGE_LOG = "false"
+# Garbage collector for both the transactor and the peer; heaps stay as set
+# by TXOR_HEAP and PEER_HEAP.
+#   g1   -XX:+UseG1GC -XX:MaxGCPauseMillis=50
+#   zgc  -XX:+UseZGC -XX:+ZGenerational (generational ZGC, JDK 21)
+GC = "g1"
+# Extra JVM options for the transactor only, e.g. -XX:+ExitOnOutOfMemoryError
+TXOR_JVM_EXTRA = ""
+# Transactor per-thread CPU sampling period for threads.jsonl; 0 turns it off.
+THREAD_MS = "5000"
 REQUIRE_MOUNT = "true"
 MIN_FREE_GIB = "200"
 
@@ -126,6 +143,32 @@ DEPS
 } > "$S/p.properties"
 cat "$S/p.properties"
 
+# JVM flags for the chosen collector; both JVMs read them from $S
+case "${GC}" in
+  g1)  GCF="-XX:+UseG1GC -XX:MaxGCPauseMillis=50" ;;
+  zgc) GCF="-XX:+UseZGC -XX:+ZGenerational" ;;
+  *)   echo "FATAL: GC must be g1 or zgc, not ${GC}"; exit 1 ;;
+esac
+echo "$GCF" > "$S/gc.flags"
+echo "${TXOR_JVM_EXTRA}" > "$S/txor-extra.flags"
+echo "gc: ${GC} ($GCF)"
+
+# Transactor logging: the release's bin/logback.xml, with the per-transaction
+# loggers set to WARN unless TX_LOG / STORAGE_LOG turn them on. The transactor
+# ignores -Dlogback.configurationFile and always reads bin/logback.xml from its
+# own release directory, so it runs from $S/dist: a copy of the release made
+# of symlinks, except for bin/logback.xml. The release itself is not changed.
+QUIET=""
+[ "${TX_LOG}" = "true" ] || QUIET="$QUIET<logger name='datomic.transaction' level='WARN'/>"
+[ "${STORAGE_LOG}" = "true" ] || QUIET="$QUIET<logger name='datomic.kv-cluster' level='WARN'/>"
+REL="${R}/releases/datomic-pro-${RELEASE}"
+rm -rf "$S/dist"; mkdir -p "$S/dist/bin"
+for f in "$REL"/*; do [ "$(basename "$f")" = bin ] || ln -s "$f" "$S/dist/"; done
+for f in "$REL"/bin/*; do [ "$(basename "$f")" = logback.xml ] || ln -s "$f" "$S/dist/bin/"; done
+awk -v q="$QUIET" '/<root /{print "  " q} {print}' "$REL/bin/logback.xml" > "$S/dist/bin/logback.xml"
+grep -q "<root " "$S/dist/bin/logback.xml" || { echo "FATAL: no <root> in bin/logback.xml"; exit 1; }
+echo "logback: tx-log=${TX_LOG} storage-log=${STORAGE_LOG}"
+
 # Both the first start and the restart run this, so they are identical.
 cat > "$S/start-txor.sh" <<'TXOR'
 #!/bin/bash
@@ -136,7 +179,7 @@ export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
 cd "$DIST"
 : > "$S/transactor.out.tmp"
 nohup bin/transactor \
-  -Xmx$HEAP -Xms$HEAP -XX:+UseG1GC -XX:MaxGCPauseMillis=50 \
+  -Xmx$HEAP -Xms$HEAP $(cat "$S/gc.flags") $(cat "$S/txor-extra.flags") \
   -Ddatomic.prefetchConcurrency=16 \
   -Dbench.metrics.transactor.out="$S/metrics-transactor.jsonl" \
   -Dcom.sun.management.jmxremote \
@@ -166,7 +209,7 @@ cgroup = "datomic-transactor"
 command = """
 set -eu
 S=${R}/scratch/tph
-"$S/start-txor.sh" "$S" "${R}/releases/datomic-pro-${RELEASE}" ${TXOR_HEAP}
+"$S/start-txor.sh" "$S" "$S/dist" ${TXOR_HEAP}
 """
 
 # --- Restore (peer JVM #1) ---------------------------------------------------
@@ -179,7 +222,7 @@ S=${R}/scratch/tph
 export JAVA_HOME=$(ls -d /usr/lib/jvm/java-21-openjdk-amd64 /usr/lib/jvm/java-21-openjdk 2>/dev/null | head -1)
 export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
 cd "$S/bench"
-clojure -J-Xmx${PEER_HEAP} -J-Xms${PEER_HEAP} -J-XX:+UseG1GC -J-XX:MaxGCPauseMillis=50 -J-server \
+clojure -J-Xmx${PEER_HEAP} -J-Xms${PEER_HEAP} $(for f in $(cat "$S/gc.flags"); do printf -- '-J%s ' "$f"; done)-J-server \
   -M -m bench.bigindex \
   --restore-from "${RESTORE_FROM}" \
   --target-datoms 0 \
@@ -206,7 +249,7 @@ OLD=$(cat "$S/txor.pid")
 kill "$OLD"
 for i in $(seq 1 60); do kill -0 "$OLD" 2>/dev/null || break; sleep 1; done
 kill -0 "$OLD" 2>/dev/null && { echo "transactor $OLD did not stop, killing"; kill -9 "$OLD"; sleep 2; }
-"$S/start-txor.sh" "$S" "${R}/releases/datomic-pro-${RELEASE}" ${TXOR_HEAP}
+"$S/start-txor.sh" "$S" "$S/dist" ${TXOR_HEAP}
 mark end
 cat "$S/phases-restart.jsonl"
 """
@@ -225,7 +268,7 @@ echo "transactor cgroup: $(cat $S/txor.cgroup)"
 FILE_LIST=$(ls ${R}/gh/${FILES} | sort | paste -sd,)
 echo "files: $(ls ${R}/gh/${FILES} | wc -l)  (${FILES}, order ${ORDER})"
 cd "$S/bench"
-clojure -J-Xmx${PEER_HEAP} -J-Xms${PEER_HEAP} -J-XX:+UseG1GC -J-XX:MaxGCPauseMillis=50 -J-server \
+clojure -J-Xmx${PEER_HEAP} -J-Xms${PEER_HEAP} $(for f in $(cat "$S/gc.flags"); do printf -- '-J%s ' "$f"; done)-J-server \
   -J-Ddatomic.metricsCallback=bench.metrics/peer \
   -J-Dbench.metrics.peer.out="$S/metrics-peer.jsonl" \
   -M -m bench.bigindex \
@@ -240,7 +283,8 @@ clojure -J-Xmx${PEER_HEAP} -J-Xms${PEER_HEAP} -J-XX:+UseG1GC -J-XX:MaxGCPauseMil
   --uri "datomic:dev://localhost:4334/${DB}" \
   --out "$S/result.json" \
   --progress "$S/progress.jsonl" \
-  --phases "$S/phases-load.jsonl" 2>&1 | tee "$S/bigindex.log"
+  --phases "$S/phases-load.jsonl" \
+  $([ "${THREAD_MS}" -gt 0 ] && echo --threads "$S/threads.jsonl" --thread-ms ${THREAD_MS}) 2>&1 | tee "$S/bigindex.log"
 test -s "$S/result.json" || { echo "FATAL: no result.json"; exit 1; }
 """
 
@@ -256,10 +300,12 @@ cp "$S/progress.jsonl" progress.jsonl 2>/dev/null || touch progress.jsonl
 cat "$S/phases-restore.jsonl" "$S/phases-restart.jsonl" "$S/phases-load.jsonl" > phases.jsonl 2>/dev/null || true
 cat "$S/restore.log" "$S/bigindex.log" > bigindex.log
 cp "$S/transactor.out" transactor.out || true
+cp "$S/dist/bin/logback.xml" logback.xml
 cp "$S/p.properties" p.properties
 grep -h "index/create-index" "$S"/log/*.log > index-jobs.log 2>/dev/null || true
 grep -h "process-monitor" "$S"/log/*.log > process-monitor.log 2>/dev/null || true
 cp "$S/metrics-transactor.jsonl" metrics-transactor.jsonl 2>/dev/null || true
+cp "$S/threads.jsonl" threads.jsonl 2>/dev/null || touch threads.jsonl
 touch index-jobs.log process-monitor.log metrics-transactor.jsonl
 
 : > cgroup-cpu.txt
@@ -301,6 +347,8 @@ def show(nm, p):
     it=p.get('index-throughput')
     print(f"  index jobs      {p['index-jobs']} jobs, {p['index-datoms']:,} datoms, {p['index-job-ms']/1000:.1f} s in-job" + (f" -> {it:,.0f} datoms/s" if it else ""))
     print(f"  transactor CPU  {cores(p):.2f} cores")
+    jv=(p or dict()).get('jvm') or dict()
+    print(f"  transactor GC   {(jv.get('gc-pause-ms') or 0)/1000:.1f} s paused ({jv.get('gc-pause-pct') or 0:.2f}%)")
 show("warmup", d.get('warmup'))
 show("measure", d)
 print(f"final datoms      {d['datoms']:,}")
@@ -350,6 +398,12 @@ path = "process-monitor.log"
 type = "upload_artifact"
 path = "metrics-transactor.jsonl"
 
+# Per-thread transactor CPU every THREAD_MS: Java id (Datomic's :tid), Linux
+# thread id, name, state and CPU ms since the previous line.
+[[jobs.steps]]
+type = "upload_artifact"
+path = "threads.jsonl"
+
 [[jobs.steps]]
 type = "upload_artifact"
 path = "cgroup-cpu.txt"
@@ -361,6 +415,10 @@ path = "storage.txt"
 [[jobs.steps]]
 type = "upload_artifact"
 path = "transactor.out"
+
+[[jobs.steps]]
+type = "upload_artifact"
+path = "logback.xml"
 
 [[jobs.steps]]
 type = "upload_artifact"

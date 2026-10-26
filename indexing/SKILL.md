@@ -44,6 +44,10 @@ benchmark and how to read what it produces.
 | `MEM_THRESHOLD`, `MEM_MAX`, `OBJECT_CACHE_MAX` | `1g`, `8g`, `8g` | Transactor memory index and cache. `OBJECT_CACHE_MAX + MEM_MAX` must be ≤ 75% of `TXOR_HEAP` or the transactor won't start |
 | `WRITE_CONCURRENCY`, `INDEX_PARALLELISM`, `INDEX_CPU_PARALLELISM` | `100`, `8`, `8` | Transactor concurrency. `index-cpu-parallelism` is ignored by Datomic 1.0.7705 |
 | `TXOR_HEAP`, `PEER_HEAP` | `24g`, `8g` | JVM heaps; both use `-Xms = -Xmx`, G1, `MaxGCPauseMillis=50` |
+| `GC` | `g1` | Collector for both the transactor and the peer: `g1` (`-XX:+UseG1GC -XX:MaxGCPauseMillis=50`) or `zgc` (generational, `-XX:+UseZGC -XX:+ZGenerational`). Heaps are unchanged |
+| `TXOR_JVM_EXTRA` | empty | Extra transactor JVM options, e.g. `-XX:+ExitOnOutOfMemoryError` |
+| `THREAD_MS` | `5000` | Per-thread transactor CPU sampling period for `threads.jsonl`; `0` turns it off |
+| `TX_LOG`, `STORAGE_LOG` | `false`, `false` | Per-transaction transactor log events (`datomic.transaction` `:tx/process`, `datomic.kv-cluster`), about 1.3 KB per tx together. Set `TX_LOG=true` for a short diagnostic run: it logs each transaction's apply time, index reads and apply breakdown. The generated config is uploaded as `logback.xml` |
 | `DB`, `RELEASE`, `R` | `gharchive`, `1.0.7705`, `/mnt/datomic/datomic-bench` | Database name, Datomic release, staging root |
 | `REQUIRE_MOUNT`, `MIN_FREE_GIB`, `MIN_FILES` | `true`, `200`, `24` | Preflight guards |
 
@@ -103,8 +107,10 @@ done
   Use the `measure` start/end to cut Rezolus.
 - **Compare like with like.** Runs are comparable only from the same
   backup, `FILES` and `ORDER` (then they load the same events).
-- **Commit latency is mostly queueing:** with `INFLIGHT=2000`, p50 is roughly
-  2000 ÷ tx/s. Compare it across runs, not as the cost of one transaction.
+- **Commit latency is mostly queueing** behind ~600–750 outstanding
+  transactions (`transact-async` blocks beyond that, so raising `INFLIGHT`
+  past ~750 changes nothing). Compare it across runs, not as the cost of one
+  transaction.
 
 Wait for a run to finish:
 
@@ -133,6 +139,8 @@ own empty output directory**. Otherwise download-all's folders collide.
 | `index-jobs.log` | One transactor line per index job: `:msec`, `:datoms`, `:written`, `:as-of-t` |
 | `bigindex.log` | Harness console output, including `PHASE ...` lines and `tx failed:` errors |
 | `metrics-transactor.jsonl` | Datomic metrics callback, about once a minute (`TransactionMsec`, `CreateEntireIndexMsec`, `MemoryIndexMB`, ...) |
+| `threads.jsonl` | Transactor CPU per thread, one line every `THREAD_MS`: `{t, interval-ms, live, threads: [{id, nid, name, state, cpu-ms, user-ms}]}`, busiest first, idle threads left out. `id` is the Java thread id that Datomic logs as `:tid`, `nid` the Linux thread id. The apply thread is `processor-<db>`. `jcmd-ms` marks the samples where `jcmd Thread.print` ran to map new threads, which pauses the JVM briefly |
+| `logback.xml` | Transactor logging config the run used (see `TX_LOG`, `STORAGE_LOG`) |
 | `cgroup-cpu.txt` | `cpu.stat`, `memory.peak`, `io.stat` for the `datomic-transactor` and `datomic-peer` cgroups |
 | `storage.txt` | Database and backup sizes on disk |
 | `logs.json` | Systemslab job log; every line has a UTC `ts`. Check here for preflight `FATAL:` messages |
@@ -176,7 +184,9 @@ Nested objects (`null` when the phase did not run):
 | `wall-ms` | Length of the measured interval |
 | `proc-cpu-cores` | Average transactor CPU in cores |
 | `proc-cpu-pct-host` | The same, as a share of the whole host |
-| `gc-count`, `gc-ms`, `gc-pct` | GC across all collectors |
+| `gc-count`, `gc-ms`, `gc-pct` | Summed over every collector bean. Under ZGC this includes concurrent cycle time, so do not compare it across collectors |
+| `gc-pause-ms`, `gc-pause-pct` | Stop-the-world pause time only (G1 Young/Old Generation, ZGC Minor/Major Pauses). Use this to compare G1 with ZGC |
+| `gc-collectors` | Per collector bean: `{name {:count :ms}}` over the interval |
 | `jit-ms`, `jit-pct` | Compile time summed over compiler threads. Can be large on short phases; it is not "% of one core" |
 | `io-read-bytes`, `io-write-bytes`, `io-write-MBps` | Transactor block-layer I/O (page-cache hits excluded) |
 | `host-cpu-pct`, `host-iowait-pct` | Whole host, from `/proc/stat` |
