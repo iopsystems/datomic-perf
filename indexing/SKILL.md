@@ -45,8 +45,11 @@ benchmark and how to read what it produces.
 | `WRITE_CONCURRENCY`, `INDEX_PARALLELISM`, `INDEX_CPU_PARALLELISM` | `100`, `8`, `8` | Transactor concurrency. `index-cpu-parallelism` is ignored by Datomic 1.0.7705 |
 | `TXOR_HEAP`, `PEER_HEAP` | `24g`, `8g` | JVM heaps; both use `-Xms = -Xmx`, G1, `MaxGCPauseMillis=50` |
 | `GC` | `g1` | Collector for both the transactor and the peer: `g1` (`-XX:+UseG1GC -XX:MaxGCPauseMillis=50`) or `zgc` (generational, `-XX:+UseZGC -XX:+ZGenerational`). Heaps are unchanged |
+| `TXOR_GC`, `PEER_GC` | empty | Collector for one JVM, overriding `GC`; empty means use `GC`. E.g. `-p TXOR_GC=zgc -p PEER_GC=g1` |
 | `TXOR_JVM_EXTRA` | empty | Extra transactor JVM options, e.g. `-XX:+ExitOnOutOfMemoryError` |
+| `PEER_JVM_EXTRA` | empty | Extra JVM options for every peer JVM (restore and load), space-separated; each gets the `-J` prefix `clojure` needs |
 | `THREAD_MS` | `5000` | Per-thread transactor CPU sampling period for `threads.jsonl`; `0` turns it off |
+| `GC_LOG` | `true` | `tph.toml` only. Transactor GC log, `-Xlog:gc*,safepoint` with UTC timestamps, uploaded as `gc.log` |
 | `TX_LOG`, `STORAGE_LOG` | `false`, `false` | Per-transaction transactor log events (`datomic.transaction` `:tx/process`, `datomic.kv-cluster`), about 1.3 KB per tx together. Set `TX_LOG=true` for a short diagnostic run: it logs each transaction's apply time, index reads and apply breakdown. The generated config is uploaded as `logback.xml` |
 | `DB`, `RELEASE`, `R` | `gharchive`, `1.0.7705`, `/mnt/datomic/datomic-bench` | Database name, Datomic release, staging root |
 | `REQUIRE_MOUNT`, `MIN_FREE_GIB`, `MIN_FILES` | `true`, `200`, `24` | Preflight guards |
@@ -87,8 +90,9 @@ time. See README "Steady-state transaction rate".
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `RESTORE_FROM` | `.../backup/idx-10m` | Backup written by `indexing.toml` (needs `bench-cursor.json`) |
+| `RESTORE_FROM` | `.../backup/idx-1b-1.0.7705` | Backup written by `indexing.toml` (needs `bench-cursor.json`) |
 | `WARMUP_MIN`, `MEASURE_MIN` | `5`, `30` | Minutes of loading before and during the measured window |
+| `WARMUP_SYNC_INDEX` | `true` | End warmup with a forced index job and a wait (`d/sync-index`) until every warmup transaction is indexed, so measure starts with an empty memory index. The wait is part of warmup, reported as `warmup.sync-index` |
 | `SAMPLE_MS` | `5000` | Progress sampling only; the stop is time-based |
 | Others | as `indexing.toml` | `BATCH`, `INFLIGHT`, `QUEUE`, transactor settings, heaps, guards. No `TARGET`, `BACKUP_NAME` or `FINAL_INDEX` |
 
@@ -139,7 +143,8 @@ own empty output directory**. Otherwise download-all's folders collide.
 | `index-jobs.log` | One transactor line per index job: `:msec`, `:datoms`, `:written`, `:as-of-t` |
 | `bigindex.log` | Harness console output, including `PHASE ...` lines and `tx failed:` errors |
 | `metrics-transactor.jsonl` | Datomic metrics callback, about once a minute (`TransactionMsec`, `CreateEntireIndexMsec`, `MemoryIndexMB`, ...) |
-| `threads.jsonl` | Transactor CPU per thread, one line every `THREAD_MS`: `{t, interval-ms, live, threads: [{id, nid, name, state, cpu-ms, user-ms}]}`, busiest first, idle threads left out. `id` is the Java thread id that Datomic logs as `:tid`, `nid` the Linux thread id. The apply thread is `processor-<db>`. `jcmd-ms` marks the samples where `jcmd Thread.print` ran to map new threads, which pauses the JVM briefly |
+| `threads.jsonl` | Transactor CPU per thread, one line every `THREAD_MS`: `{t, interval-ms, live, threads: [{id, nid, name, state, cpu-ms, user-ms}]}`, busiest first, idle threads left out. `id` is the Java thread id that Datomic logs as `:tid`, `nid` the Linux thread id. The apply thread is `processor-<db>`. `jcmd-ms` marks the samples where `jcmd Thread.print` ran to map new threads, which pauses the JVM briefly. `cpu-ms` is CPU used since the previous line. Java threads only: the JVM's native GC and JIT threads are not listed |
+| `gc.log` | `tph.toml` with `GC_LOG=true`: the transactor's unified GC log, one section per transactor start (`=== transactor pid N`, restore then timed load). Every pause and collector phase, heap before/after, and safepoints, each line stamped `[UTC time][JVM uptime][level][tags]`. About 1–2 MB per run with G1 and 3 MB with ZGC |
 | `logback.xml` | Transactor logging config the run used (see `TX_LOG`, `STORAGE_LOG`) |
 | `cgroup-cpu.txt` | `cpu.stat`, `memory.peak`, `io.stat` for the `datomic-transactor` and `datomic-peer` cgroups |
 | `storage.txt` | Database and backup sizes on disk |
@@ -175,6 +180,7 @@ Nested objects (`null` when the phase did not run):
 |---|---|
 | `restore` | `restore-ms` (the `restore-db` command), `exit`, `bytes`, `mib-per-sec`, `datoms`, `datoms-per-sec`, `connect-ms` / `first-stats-ms` (cold peer), `from`, `tail`, `jvm` |
 | `final-index` | `ms` (`request-index` + `sync-index`), `index-jobs`, `index-datoms`, `index-job-ms`, `jvm` |
+| `warmup.sync-index` | `tph.toml` with `WARMUP_SYNC_INDEX=true`: the same fields as `final-index`, for the index wait that ends warmup |
 | `backup` | `backup-ms`, `exit`, `bytes`, `tail`, `jvm` |
 
 `jvm` deltas measure the **transactor** (JMX + `/proc`), not the peer:

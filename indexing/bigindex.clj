@@ -14,6 +14,9 @@
    phases share one producer, so the measure phase continues the event stream
    exactly where warmup stopped. Each reports peer-side transactions per
    second/hour and commit latency alongside the usual index accounting.
+   --warmup-sync-index true ends warmup with a forced index job and a wait
+   (d/sync-index) until every warmup transaction is in the durable index, so
+   measure starts with an empty memory index.
 
    --cursor-from DIR resumes from DIR's bench-cursor.json without restoring:
    for a database restored by an earlier process (e.g. before a JVM restart).
@@ -570,9 +573,13 @@
   "Index whatever is still in the memory index and time it. A short load on
    top of a large restored database may never reach memory-index-threshold,
    so without this the phase would measure ingest only, not the merge of new
-   datoms into the large durable index."
-  [conn logd jmxc txpid ncpu]
-  (printf "%n=== FINAL INDEX ===%n") (flush)
+   datoms into the large durable index.
+
+   At the end of warmup (--warmup-sync-index) the same wait empties the
+   memory index, so the measure phase starts with nothing left over from
+   warmup to index."
+  [conn logd jmxc txpid ncpu label]
+  (printf "%n=== %s ===%n" label) (flush)
   (let [jobs0 (count (index-jobs logd))
         t     (d/basis-t (d/db conn))
         probe (txor-probe jmxc txpid ncpu)
@@ -672,6 +679,7 @@
         measure  (parse-long (or (get a "measure-ms") "0"))
         timed?   (pos? measure)
         final?   (= "true" (get a "final-index" "false"))
+        warmup-sync? (= "true" (get a "warmup-sync-index" "false"))
         sample   (parse-long (or (get a "sample-ms") "15000"))
         outf     (or (get a "out") "bigindex-result.json")
         progf    (or (get a "progress") "bigindex-progress.jsonl")
@@ -688,8 +696,8 @@
               (/ warmup 60000.0) (/ measure 60000.0) (count files) batch inflight qdepth hints?)
       (printf "target=+%,d datoms  files=%d  batch=%d  inflight=%d  queue=%d  hints=%s%n"
               target (count files) batch inflight qdepth hints?))
-    (printf "uri=%s  restore-from=%s  backup-dir=%s  final-index=%s  order=%s  resume=%s%n"
-            uri (or restore "-") (or bdir "-") final? order resume?)
+    (printf "uri=%s  restore-from=%s  backup-dir=%s  final-index=%s  warmup-sync-index=%s  order=%s  resume=%s%n"
+            uri (or restore "-") (or bdir "-") final? warmup-sync? order resume?)
     (flush)
 
     (when-not (#{"asc" "desc"} order)
@@ -764,9 +772,17 @@
                            (flush))
                   now  #(:datoms (d/db-stats (d/db conn)))
                   wu   (when (pos? warmup)
-                         (ph "warmup" #(load-phase! conn (assoc opts :label "warmup" :base (now)
+                         (ph "warmup"
+                             #(let [r (load-phase! conn (assoc opts :label "warmup" :base (now)
                                                                :duration-ms warmup :src src)
-                                                    jmxc txpid ncpu)))
+                                                   jmxc txpid ncpu)]
+                                ;; load-phase! has drained its in-flight txs, so
+                                ;; basis-t covers all of them; meanwhile the
+                                ;; producer blocks on the full queue
+                                (cond-> r
+                                  warmup-sync? (assoc :sync-index
+                                                      (final-index! conn logd jmxc txpid ncpu
+                                                                    "WARMUP SYNC INDEX"))))))
                   ld   (ph "measure" #(load-phase! conn (assoc opts :label "measure" :base (now)
                                                              :duration-ms measure :src src)
                                                   jmxc txpid ncpu))]
@@ -779,7 +795,7 @@
                                            jmxc txpid ncpu))]
 
             :else [nil nil])
-          fi   (when final? (ph "final-index" #(final-index! conn logd jmxc txpid ncpu)))
+          fi   (when final? (ph "final-index" #(final-index! conn logd jmxc txpid ncpu "FINAL INDEX")))
           bk   (when bdir (ph "backup" #(backup-phase! dist uri bdir jmxc txpid ncpu)))
           cursor {:order order :files names
                   :events (+ skip (or (:source-events ld) 0))}

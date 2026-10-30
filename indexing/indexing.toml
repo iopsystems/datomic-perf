@@ -38,6 +38,7 @@ DB = "gharchive"
 # Empty or "none" skips the restore phase and starts from a fresh database.
 RESTORE_FROM = ""
 # Written to ${R}/backup/${BACKUP_NAME}. Empty or "none" skips the backup.
+# Name backups <size>-<RELEASE> (e.g. idx-1b-1.0.7705) so the building release is visible.
 BACKUP_NAME = "indexing"
 FILES = "*.json.gz"
 MIN_FILES = "24"
@@ -73,13 +74,18 @@ PEER_HEAP = "8g"
 #                LogWriteMsec and PodUpdateMsec metrics cover the same timing
 TX_LOG = "false"
 STORAGE_LOG = "false"
-# Garbage collector for both the transactor and the peer; heaps stay as set
-# by TXOR_HEAP and PEER_HEAP.
+# Garbage collector; heaps stay as set by TXOR_HEAP and PEER_HEAP.
 #   g1   -XX:+UseG1GC -XX:MaxGCPauseMillis=50
 #   zgc  -XX:+UseZGC -XX:+ZGenerational (generational ZGC, JDK 21)
+# GC applies to both JVMs. TXOR_GC and PEER_GC override it for one of them,
+# e.g. -p TXOR_GC=zgc -p PEER_GC=g1; empty means use GC.
 GC = "g1"
-# Extra JVM options for the transactor only, e.g. -XX:+ExitOnOutOfMemoryError
+TXOR_GC = ""
+PEER_GC = ""
+# Extra JVM options for one JVM, e.g. TXOR_JVM_EXTRA=-XX:+ExitOnOutOfMemoryError.
+# PEER_JVM_EXTRA applies to every peer JVM (restore and load).
 TXOR_JVM_EXTRA = ""
+PEER_JVM_EXTRA = ""
 # Transactor per-thread CPU sampling period for threads.jsonl; 0 turns it off.
 THREAD_MS = "5000"
 REQUIRE_MOUNT = "true"
@@ -168,15 +174,24 @@ export PATH="$JAVA_HOME/bin:/usr/local/bin:$PATH"
 } > "$S/p.properties"
 cat "$S/p.properties"
 
-# JVM flags for the chosen collector; both JVMs read them from $S
-case "${GC}" in
-  g1)  GCF="-XX:+UseG1GC -XX:MaxGCPauseMillis=50" ;;
-  zgc) GCF="-XX:+UseZGC -XX:+ZGenerational" ;;
-  *)   echo "FATAL: GC must be g1 or zgc, not ${GC}"; exit 1 ;;
-esac
-echo "$GCF" > "$S/gc.flags"
+# JVM flags per JVM, written to $S where start-txor.sh and the peer steps read
+# them: txor-gc.flags / peer-gc.flags for the collector, *-extra.flags for the
+# rest
+gcflags() {
+  case "$1" in
+    g1)  echo "-XX:+UseG1GC -XX:MaxGCPauseMillis=50" ;;
+    zgc) echo "-XX:+UseZGC -XX:+ZGenerational" ;;
+    *)   echo "FATAL: $2 must be g1 or zgc, not '$1'" >&2; return 1 ;;
+  esac
+}
+TG="${TXOR_GC}"; [ -n "$TG" ] || TG="${GC}"
+PG="${PEER_GC}"; [ -n "$PG" ] || PG="${GC}"
+gcflags "$TG" TXOR_GC > "$S/txor-gc.flags"
+gcflags "$PG" PEER_GC > "$S/peer-gc.flags"
 echo "${TXOR_JVM_EXTRA}" > "$S/txor-extra.flags"
-echo "gc: ${GC} ($GCF)"
+echo "${PEER_JVM_EXTRA}" > "$S/peer-extra.flags"
+echo "transactor gc: $TG ($(cat "$S/txor-gc.flags")) extra: ${TXOR_JVM_EXTRA}"
+echo "peer gc:       $PG ($(cat "$S/peer-gc.flags")) extra: ${PEER_JVM_EXTRA}"
 
 # Transactor logging: the release's bin/logback.xml, with the per-transaction
 # loggers set to WARN unless TX_LOG / STORAGE_LOG turn them on. The transactor
@@ -196,7 +211,7 @@ echo "logback: tx-log=${TX_LOG} storage-log=${STORAGE_LOG}"
 
 cd "$S/dist"
 nohup bin/transactor \
-  -Xmx${TXOR_HEAP} -Xms${TXOR_HEAP} $(cat "$S/gc.flags") $(cat "$S/txor-extra.flags") \
+  -Xmx${TXOR_HEAP} -Xms${TXOR_HEAP} $(cat "$S/txor-gc.flags") $(cat "$S/txor-extra.flags") \
   -Ddatomic.prefetchConcurrency=16 \
   -Dbench.metrics.transactor.out="$S/metrics-transactor.jsonl" \
   -Dcom.sun.management.jmxremote \
@@ -255,7 +270,7 @@ cat > "$BENCH/deps.edn" <<DEPS
 DEPS
 
 cd "$BENCH"
-clojure -J-Xmx${PEER_HEAP} -J-Xms${PEER_HEAP} $(for f in $(cat "$S/gc.flags"); do printf -- '-J%s ' "$f"; done)-J-server \
+clojure -J-Xmx${PEER_HEAP} -J-Xms${PEER_HEAP} $(for f in $(cat "$S/peer-gc.flags" "$S/peer-extra.flags"); do printf -- '-J%s ' "$f"; done)-J-server \
   -J-Ddatomic.metricsCallback=bench.metrics/peer \
   -J-Dbench.metrics.peer.out="$S/metrics-peer.jsonl" \
   -M -m bench.bigindex \

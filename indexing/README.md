@@ -1,16 +1,26 @@
 # Datomic indexing benchmark
 
-This benchmark measures how fast a Datomic Pro transactor ingests and indexes
-[GH Archive](https://www.gharchive.org/) events. It has three optional phases: `restore` that uses the `restore-db` to load a backup index; `index` that keeps index a fixed amount of datoms; `backup` that backs up the index to local files. This benchmark uses one transactor and a seperate peer JVM. It collects datomic, JVM, and host-level performance metrics.
+This benchmark measures Datomic indexing performance with the public
+[GH Archive](https://www.gharchive.org/) records. Each run uses one transactor and a separate peer JVM, and collects Datomic, JVM and host-level metrics.
+
+There are two Systemslab specs, and they share one harness:
+
+- **`tph.toml` measures.** It restores a backup, warms up, then indexing for a
+  fixed time and reports peer-side transactions per second, commit latency and the
+  transactor's indexing throughput. It has a a list of parameters for comparing releases, GC and transactor settings.
+- **`indexing.toml` builds backups.** It loads a fixed number of datoms, from
+  scratch or on top of a restored backup, and backs the result up. That is how
+  the `idx-1b-1.0.7705`, `idx-2b-1.0.7705` and `idx-4b-1.0.7705` databases that `tph.toml` restores are
+  made. See [Building backups](#building-backups-indexingtoml).
 
 | File | Role |
 |---|---|
+| [`tph.toml`](tph.toml) | Measurement spec: restore a backup, restart both JVMs, warm up, then measure for a fixed time |
+| [`indexing.toml`](indexing.toml) | Backup-building spec: optional restore, load `TARGET` datoms, optional backup |
 | [`bigindex.clj`](bigindex.clj) | The harness (`bench.bigindex`): restore, streaming load, final index, backup, and all measurement |
 | [`gharchive.clj`](gharchive.clj) | Schema and the GH event → tx-data mapping |
 | [`jvmstats.clj`](jvmstats.clj) | JMX and `/proc` snapshots of the transactor |
 | [`metrics.clj`](metrics.clj) | Datomic metrics callback for the transactor and peer |
-| [`indexing.toml`](indexing.toml) | The Systemslab spec: newest-first, one event per transaction, every phase optional |
-| [`tph.toml`](tph.toml) | Steady-state spec: restore a backup, restart both JVMs, warm up, then measure transactions per hour for a fixed time |
 | [`setup-host.sh`](setup-host.sh) | Stage a host: JDK, Clojure, Datomic release, GH Archive, harness |
 | [`SCHEMA.md`](SCHEMA.md) | Schema details and their indexing cost |
 
@@ -18,10 +28,9 @@ This benchmark measures how fast a Datomic Pro transactor ingests and indexes
 ## Process layout
 
 Each run starts a transactor and a separate peer JVM, each in its own cgroup.
-Their CPU, memory and I/O are therefore accounted separately (`cgroup-cpu.txt`).
+Their CPU, memory and I/O are therefore accounted separately.
 
 ```
- cgroup datomic-transactor             cgroup datomic-peer
 ┌─────────────────────────┐          ┌──────────────────────────────────┐
 │ bin/transactor (dev/H2) │◀─────────│ bench.bigindex                   │
 │  - applies transactions │ tx-async │  - producer thread (parse, map)  │
@@ -36,7 +45,53 @@ Indexing happens in the transactor, not in the peer that calls `d/transact`.
 That is why every JVM measurement targets the transactor process (see
 [Measurement](#measurement)).
 
-## Three optional phases
+## Measuring indexing throughput: `tph.toml`
+
+`tph.toml` measures the indexing performance of Datomic using the public data source GH Archive. It has three phases: restore that restores the index from a index backup, warmup that sends transactions to transactor for 5 minutes to warmup both Peer and Transactor JVM, then the the 30 minute measure phase. After the restore phase, we restart both Peer and Transactor JVM. In the end of warmup phase, the peer sends out a sync-index and request-index request to finish indexing all inflight records before starting the measure phase.
+
+| Step | What happens |
+|---|---|
+| **restore** | Peer JVM #1 runs `bin/datomic restore-db` of `RESTORE_FROM` (default `backup/idx-1b-1.0.7705`) into fresh dev storage, then exits |
+| **restart** | The transactor is stopped and started again with the same `p.properties` and heap |
+| **warmup** | Peer JVM #2 resumes the event stream from the backup's cursor and loads for `WARMUP_MIN` (5) minutes: JIT, caches and the memory index fill up. With `WARMUP_SYNC_INDEX=true` (default) it then forces an index job and waits (`d/request-index` + `d/sync-index`) until every warmup transaction is in the durable index, so measure starts with an empty memory index |
+| **measure** | The same JVM loads for `MEASURE_MIN` (30) more minutes; this window is the result |
+
+- **Why restart.** Without it, the measured transactor would be the one that
+  served the restore, with whatever that left in its heap and caches.
+  Restarting both JVMs makes the measured system one that started on an
+  existing database and loaded its index from storage.
+- **One stream across warmup and measure.** Both phases read from one producer,
+  so measure starts at exactly the event warmup stopped at. Nothing is
+  skipped or replayed between them.
+- **Same events every run.** Every run restores the same backup and resumes at
+  the same cursor, so runs that differ only in a setting (e.g.
+  `WRITE_CONCURRENCY`) load the same events.
+- **Nothing is backed up.** The grown database is deleted at the end.
+
+
+
+### Key Parameters
+
+| Parameter | Default | What it changes |
+|---|---|---|
+| `RELEASE` | `1.0.7705` | Datomic release under `releases/datomic-pro-<RELEASE>` |
+| `RESTORE_FROM` | `backup/idx-1b-1.0.7705` | Starting database. On EC2: `idx-1b-1.0.7705`, `idx-2b-1.0.7705`, `idx-4b-1.0.7705` (all hosts) and `idx-1b-1.0.7622` (datomic-perf only); on amd: `idx-10m`. Backup names end in the release that built them |
+| `INDEX_PARALLELISM` | 8 | Transactor `index-parallelism`. 1.0.7705 refuses values above 8 at startup (`:db.error/invalid-config-value`); 1.0.7745 accepts more |
+| `INDEX_CPU_PARALLELISM` | 8 | Transactor `index-cpu-parallelism`. 1.0.7705 accepts it but ignores it |
+| `GC`, `TXOR_GC`, `PEER_GC` | `g1` | `g1` or `zgc` (generational) for both JVMs, or for one of them |
+| `TXOR_HEAP`, `PEER_HEAP` | 24g, 8g | Heaps. `OBJECT_CACHE_MAX` + `MEM_MAX` must be at most 75% of `TXOR_HEAP` |
+| `WARMUP_MIN`, `MEASURE_MIN` | 5, 30 | Phase lengths |
+| `WARMUP_SYNC_INDEX` | `true` | Force an index job at the end of warmup, so measure starts fully indexed |
+| `GC_LOG` | `true` | Transactor GC log (`gc.log`), stamped in UTC. ZGC pauses only show up here, not in JMX |
+| `THREAD_MS` | 5000 | Transactor per-thread CPU sampling period for `threads.jsonl`; 0 turns it off |
+
+
+
+## Building backups: `indexing.toml`
+
+`indexing.toml` builds the databases that `tph.toml` restores. It also has three optional phases: restore that restores the index from an index backup; index that indexes a fixed number of datoms; the backup phase that generates a new index backup.
+
+### Three optional phases
 
 A run executes up to three phases in order. Each one is switched on by a spec
 parameter:
@@ -51,58 +106,9 @@ Without a restore, the harness creates the database and transacts the schema.
 After a restore, the schema is already in the database and is not
 re-transacted.
 
-### Restore
+## Benchmark Methodology
 
-Dev storage is served by the transactor, so the transactor must be running
-before `restore-db` can write to it. After the restore, the harness times the
-first connect and the first `db-stats`. Both are cold: the peer has nothing
-cached and has to read the index roots from storage.
-
-`TARGET` is the number of **new** datoms to add on top of whatever the
-database starts with. The load stops once the datom count reaches
-`base + TARGET`, where `base` is the restored datom count, or 0 for a fresh
-database. For example, a restore of 1,028,835 datoms with `TARGET=1000000`
-loads until at least 2,028,835 datoms. Every added datom is indexed, either by
-a job during the load or by the forced final index. In that run (with the
-earlier 64m memory-index threshold), the three index jobs covered exactly the
-1,035,471 datoms added. Restored datoms are
-already in the durable index and are not indexed again.
-
-### Resuming the event stream
-
-A restored database already holds some events. Replaying those events would
-upsert onto existing entities and add almost no datoms, so a restored run has
-to continue past them.
-
-Every successful backup writes `bench-cursor.json` into the backup directory.
-It records the file order, the file list and how many events the stream had
-consumed. When `indexing.toml` restores a backup, it passes `--resume true`:
-the harness reads the cursor and skips that many events before transacting.
-Skipped lines are gunzipped but not parsed. The harness refuses to resume if
-the order or the file list differs from the backup's, because the event count
-would then point somewhere else. `restore-db` ignores the extra file.
-
-A backup without a cursor, written before this mechanism existed, cannot be
-restored by `indexing.toml`. At the harness level you can still restore one
-without `--resume` and pass `--files` the backup never saw.
-
-### Final index
-
-A short load may never reach `memory-index-threshold`, so no index job runs
-during it. With the default `MEM_THRESHOLD=1g`, a 1M-datom load is one of
-these: every datom is indexed by the final job. Without a forced
-job, the run would measure ingest only, not the cost of merging new datoms
-into the large durable index. `final-index` calls `d/request-index` followed by
-`d/sync-index` and times both. It then waits 5 s so the job's log line lands
-before it is parsed.
-
-### Backup
-
-`backup-db` writes to `${R}/backup/${BACKUP_NAME}`. The harness records the
-latency, the size on disk and the exit code. If the restore or the backup
-exits non-zero, the experiment fails.
-
-## Loading GH Archive: producer and consumer
+### Loading GH Archive: producer and consumer
 
 Hourly GH Archive files are about 75–150 MB of gzipped JSON each. Earlier
 harnesses (`bench.idxbench`) parsed everything into the peer heap before
@@ -155,21 +161,16 @@ depth rather than by the dataset:
 `indexing.toml` defaults to one end of this design. The earlier 1B-datom run
 used the other end, and both can be set through parameters:
 
-| | `indexing.toml` default | Earlier 1B-datom run |
+| | `tph.toml` default | `indexing.toml` |
 |---|---|---|
-| `BATCH` (events per tx) | **1** | 1000 |
-| `QUEUE` (txs) | **100000** | 2000 |
-| `INFLIGHT` (txs) | **2000** | 500 |
-| `ORDER` | **desc** (newest first) | asc |
-| `SAMPLE_MS` | **1000** | 15000 |
+| `BATCH` (events per tx) | 1 | 1 |
+| `QUEUE` (txs) | 100000 | 100000 |
+| `INFLIGHT` (txs) | 2000 | 2000 |
+| `ORDER` | desc | desc |
+| `SAMPLE_MS` | 5000 | 1000 |
 
-With `BATCH=1`, every GH event is its own transaction. Throughput then comes
-from concurrency (a deep queue and many transactions in flight), not from
-batching, which stresses per-transaction overhead in the transactor. On amd,
-this ingested about 34k datoms/s, against about 85k datoms/s with 1000 events
-per transaction.
 
-## Schema
+### Schema
 
 The full schema, with the mapping and each design choice's indexing cost, is in
 [`SCHEMA.md`](SCHEMA.md). In short:
@@ -198,219 +199,68 @@ event ──:event/actor──▶ user
   without an id are left off the event, since a nil identity would fail the
   whole transaction.
 
-### Transaction conflicts
+### Datomic Indexing throughput
 
-**What causes them.** GH Archive records each user, repo and org with its
-numeric id *and* the name it had when the event happened. When an account or
-repo is renamed, or only its capitalization changes, the same id shows up
-under two names:
+Transaction throughput is measured at the peer. The benchmark replays GitHub Archive events, one event per transaction, through d/transact-async. A producer fills a queue of up to 100,000 transactions, and the consumer keeps up to 2,000 in flight before it waits for the whole group to commit. Transaction throughput is the number of committed transactions (issued minus failed) divided by the length of the phase. All in-flight transactions are awaited before the phase clock stops. Commit latency is recorded per transaction from submit to completion. Indexing throughput is measured at the transactor. Each index job writes an :index/create-index line to the transactor log with the number of datoms it indexed (:datoms) and how long it took (:msec). Indexing throughput is the total :datoms divided by the total :msec over the jobs that finish within the phase. It is therefore a rate over time spent indexing, not over the whole 30 minutes, and the summary reports the job count and total time in jobs next to it.
 
-```
-user 19433964    oVinayak-MP / vinayakmp007          (2024-01-01, hour 15)
-repo 732652557   GangaTricks/Quiz  15:00:28  →  GangaTricks/quiz  15:25:56
-```
+### JVM Metrics
+We use JMX to take a snapshot in the start and the end of each phase to collect GC, JIT, CPU, and heap usage. Every 5 second, we also use jmx to collect the per-thread CPU usage. We also collect the GC log.
+### Rezolus Metrics
 
-In 2024-01-01 hour 15 (180k events), 9 user ids and 79 repo ids appear with
-two names. Repo renames are by far the most common case.
+### Phase timestamps for Rezolus
 
-**Why Datomic rejects it.** `:user/id`, `:repo/id` and `:org/id` are
-`:db.unique/identity`, so within one transaction every map carrying the same id
-resolves to the **same entity**. `:user/login`, `:repo/name` and `:org/login`
-are cardinality-one, so asserting two different values for one entity in one
-transaction is a contradiction. Datomic rejects the **whole** transaction, and
-every event in it is lost:
+Systemslab records host metrics with Rezolus (`metrics.rez`, one sample
+per second). To cut those metrics by phase, the harness brackets every phase
+with UTC wall-clock markers. They are written to three places:
 
-```
-:db.error/datoms-conflict Two datoms in the same transaction conflict
-{:d1 [17592186045420 :repo/name "GangaTricks/Quiz" 13194139534313 true],
- :d2 [17592186045420 :repo/name "GangaTricks/quiz" 13194139534313 true]}
-```
+- `bigindex.log`: `PHASE index start 2026-10-16T12:35:47.207Z (1792154147207)`
+- `phases.jsonl`: one line per marker, appended as it happens, so a crashed
+  run still records the start of the phase it died in
+- `result.json` → `phases`: `start-ms`, `end-ms`, ISO times and duration
 
-The same rename split across two transactions is fine. The second transaction
-retracts the old value and asserts the new one, and the history keeps both. The
-same name repeated in one transaction is also fine, because redundant datoms
-collapse.
-
-| Same id, two names | Result |
-|---|---|
-| in one transaction | `:db.error/datoms-conflict`, the whole tx fails |
-| in two transactions | OK: retract old name, assert new name |
-| in one transaction after `dedupe-tx` | OK: the first name wins for that tx |
-
-**Why batch size matters.** A conflict needs both names inside one
-transaction, and an hour holds about 180k–300k events. So the larger the
-batch, the longer the time window it covers, and the more likely it is to
-contain both sides of a rename. Batching the 48 staged hours (9.6M events)
-without `dedupe-tx`:
-
-| Events per tx | Approx. time per tx | Failed txs | Events lost |
-|---|---|---|---|
-| 1 | — | 0 (impossible) | 0 |
-| 100 | 1–2 s | 3 / 96,211 | 300 (0.003%) |
-| 1,000 | 10–20 s | 5 / 9,622 | 5,000 (0.05%) |
-| 2,000 | 20–40 s | 18 / 4,811 | 36,000 (0.37%) |
-| 5,000 | 1–2 min | 120 / 1,925 | 600,000 (6.2%) |
-| 10,000 | 2–3 min | 325 / 963 | 3,250,000 (33.8%) |
-
-Before `dedupe-tx` existed, this capped how large a batch could be. Even at
-1,000 events per transaction, a long run loses a few whole transactions.
-
-**The fix: `dedupe-tx`.** For each identity, `dedupe-tx` keeps the first full
-map in a transaction and reduces later mentions to the id alone:
-
-```clojure
-{:event/actor {:user/id 1 :user/login "kevinr99089"}}  ; kept in full
-{:event/actor {:user/id 1}}                            ; id only, still upserts
-```
-
-Every event and every reference survives. The later name is dropped only for
-that transaction, and the next transaction that mentions the id updates it.
-With `BATCH=1`, there is only one event per transaction, so conflicts cannot
-happen and `dedupe-tx` has nothing to do.
-
-**Reproducing it.** Transact two maps with the same `:user/id` and different
-`:user/login` in one transaction against a `datomic:mem://` database with the
-schema from `gharchive.clj`. Or batch a real hour with the same rule the table
-above uses: a batch fails if any id appears in it with two different names.
-
-## Steady-state transaction rate: `tph.toml`
-
-`indexing.toml` answers "how long does it take to add N datoms". `tph.toml`
-answers "how many transactions per hour does a warm system sustain on top of
-an existing database", and how fast the transactor indexes meanwhile.
-
-| Step | What happens |
-|---|---|
-| **restore** | Peer JVM #1 runs `bin/datomic restore-db` of `RESTORE_FROM` (default `backup/idx-10m`) into fresh dev storage, then exits |
-| **restart** | The transactor is stopped and started again with the same `p.properties` and heap |
-| **warmup** | Peer JVM #2 resumes the event stream from the backup's cursor and loads for `WARMUP_MIN` (5) minutes: JIT, caches and the memory index fill up |
-| **measure** | The same JVM loads for `MEASURE_MIN` (30) more minutes; this window is the result |
-
-- **Why restart.** Without it, the measured transactor would be the one that
-  served the restore, with whatever that left in its heap and caches.
-  Restarting both JVMs makes the measured system one that started on an
-  existing database and loaded its index from storage.
-- **One stream across warmup and measure.** Both phases read from one producer,
-  so measure starts at exactly the event warmup stopped at. Nothing is
-  skipped or replayed between them.
-- **Same events every run.** Every run restores the same backup and resumes at
-  the same cursor, so runs that differ only in a setting (e.g.
-  `WRITE_CONCURRENCY`) load the same events.
-- **Nothing is backed up.** The grown database is deleted at the end.
-
-What the measure phase reports (`result.json`, top level; warmup's own numbers
-are under `warmup`):
-
-| Field | Meaning |
-|---|---|
-| `tx-per-sec`, `tx-per-hour` | Transactions that committed, divided by the window (peer side). With `BATCH=1` a transaction is one GH event |
-| `ingest-datoms-per-sec` | Datoms added in the window ÷ window |
-| `commit-latency` | p50/p90/p99/p99.9/max ms from `transact-async` to the future completing, on 1%-wide buckets |
-| `index-jobs`, `index-datoms`, `index-throughput` | Transactor index jobs whose log line landed in the window, and Σdatoms ÷ Σmsec over them |
-| `jvm` | Transactor JVM and `/proc` deltas over the window |
-
-Commit latency includes the time a transaction waits behind the other
-outstanding ones, so it mostly reflects queueing, not the cost of one
-transaction. About 600–750 transactions are outstanding at once whatever
-`INFLIGHT` is (see the `INFLIGHT` sweep below).
-
-An index job is counted in the window its log line lands in, so a job that
-started in warmup and finished in measure counts fully in measure.
-
-**Event budget.** At ~7k tx/s a 35-minute run uses ~15M events. The 96 hours
-staged on amd (2024-01-01, 2024-01-29, 2024-01-30, 2024-02-01) hold 21.1M
-events, of which `idx-10m` used the first 1.2M, so a run stays on real events
-up to about 9.5k tx/s. Past that the producer replays the files with offset
-ids (`cycles` > 0 in `result.json`).
-
-**Disk per run.** At ~60k datoms/s the database grows by roughly 120M datoms
-in 35 minutes. The transactor log stays small: by default the specs set the
-two per-transaction loggers (`datomic.transaction`, `datomic.kv-cluster`) to
-WARN. With `TX_LOG=true` and `STORAGE_LOG=true` the log grows by about 1.3 KB
-per transaction, tens of GB in `scratch/tph/log` per run, and the next run's
-preflight deletes it.
+`progress.jsonl` adds a wall-clock sample every `SAMPLE_MS` inside the index
+phase. To slice Rezolus by phase, fetch the series and filter by
+`start-ms`/`end-ms`:
 
 ```bash
-# one run, defaults (restore idx-10m, 5 + 30 min)
-systemslab submit tph.toml -p HOST=amd -p REQUIRE_MOUNT=false -p MIN_FREE_GIB=20
-# write-concurrency sweep
-for wc in 4 50 100; do
-  systemslab submit tph.toml -p HOST=amd -p REQUIRE_MOUNT=false -p MIN_FREE_GIB=20 \
-    -p WRITE_CONCURRENCY=$wc
-done
+systemslab promql --experiment <ID> --output json 'sum(rate(cpu_usage[5s]))'
 ```
 
-`RESTORE_FROM` must be a backup written by `indexing.toml` (it needs
-`bench-cursor.json`), and `FILES`/`ORDER` must match the ones it was built
-with.
+### Outputs
 
-### Results on amd: `WRITE_CONCURRENCY` sweep
+| Artifact | Contents |
+|---|---|
+| `result.json` | Every phase's numbers, `jvm` deltas, `phases`, event-stream cursor |
+| `progress.jsonl` | Growth curve during the load (`tph.toml`: warmup and measure) |
+| `phases.jsonl` | Phase start/end markers (`tph.toml` also marks restore and restart) |
+| `bigindex.log` | Harness console output (`tph.toml`: the restore JVM's output first) |
+| `restore-result.json` | Restore time and datom count (`tph.toml`) |
+| `index-jobs.log` | The transactor's `:index/create-index` lines |
+| `metrics-transactor.jsonl` | Datomic metrics callback samples |
+| `threads.jsonl` | Transactor per-thread CPU every `THREAD_MS` |
+| `process-monitor.log` | The transactor log's `process-monitor` lines (periodic transactor status) |
+| `cgroup-cpu.txt` | `cpu.stat`, `memory.peak`, `io.stat` per cgroup |
+| `storage.txt` | Database and backup sizes on disk |
+| `transactor.out`, `logback.xml` | Transactor stdout and the logging config it ran with |
+| `gc.log` | Transactor GC log (`tph.toml`, `GC_LOG=true`) |
+| `metrics.rez` | Rezolus host metrics (recorded by Systemslab) |
 
-`idx-10m` restored, 5 + 30 min, `BATCH=1`, `INFLIGHT=2000`, other settings
-at their defaults. Measure window only; one run per setting.
+### Running
+  A typical experiment has two runs. First, `indexing.toml` builds the database that later measurements start from. With no `RESTORE_FROM`, it creates an empty `gharchive` database and transacts the schema. It then streams GitHub Archive
+  events into it, newest hour first, until the database has grown by `TARGET` datoms. Next it forces one final index job, so the backup holds no unindexed data, and writes a full backup to `backup/<BACKUP_NAME>/` with `bench-cursor.json`
+  beside it. The cursor records how far into the event stream the run got. Second, `tph.toml` measures on top of that backup. It restores `RESTORE_FROM` into fresh storage and restarts the transactor so the measurement starts with a cold JVM.
+  It resumes the event stream at the backup's cursor, so no event is replayed, and runs a 5-minute warmup that ends with a forced index job and `d/sync-index`. It then measures for 30 minutes with the same load settings (`BATCH=1`,
+  `QUEUE=100000`, `INFLIGHT=2000`). Both specs collect the transactor log, GC log, JVM and thread samples, and the Rezolus recording as experiment artifacts. Then they delete the live database and keep the backups.
 
-| `WRITE_CONCURRENCY` | tx/s | tx/h | datoms/s | index throughput | commit p50 / p99 | transactor CPU |
-|---|---|---|---|---|---|---|
-| 4 | 7,061 | 25.4M | 55,941 | 151,613 datoms/s (13 jobs) | 87 / 164 ms | 6.3 cores |
-| 50 | 6,883 | 24.8M | 54,557 | 156,795 datoms/s (13 jobs) | 89 / 169 ms | 6.2 cores |
-| 100 | 6,836 | 24.6M | 54,194 | 154,358 datoms/s (13 jobs) | 90 / 170 ms | 6.2 cores |
+  ```bash
+  # build a 1B-datom backup (once per host, or copy it from another host)
+  systemslab submit indexing.toml -p HOST=datomic.bench \
+    -p TARGET=1000000000 -p BACKUP_NAME=idx-1b-1.0.7705
 
-Write concurrency makes no measurable difference: the spread is about 3%, within
-what one run per setting can resolve. The transactor's own metrics
-(`metrics-transactor.jsonl`) show why. `TransactionApplyMsec` averages
-0.13 ms per transaction, and summed over a second it reaches 0.93 s in every
-run: the transactor applies transactions one at a time, and that step is
-93% busy, capping the rate near 1 ÷ 0.13 ms ≈ 7.5k tx/s. Per-thread CPU
-during a measure window agrees: the transactor's `processor-gharchive`
-thread runs at ~95% of one core, while no peer thread exceeds ~35%, so
-neither the producer nor the consumer is the limit. Storage writes
-are only ~2.6 MB/s, so a limit on concurrent writes has nothing to throttle.
-
-### Results on amd: `INFLIGHT` sweep
-
-Same setup, `WRITE_CONCURRENCY=100`. The 2000 row is a second run of the
-default, which gives the run-to-run spread (6,783 vs 6,836 tx/s, under 1%).
-
-| `INFLIGHT` | tx/s | tx/h | datoms/s | index throughput | commit p50 / p99 |
-|---|---|---|---|---|---|
-| 2,000 | 6,783 | 24.4M | 53,771 | 158,471 datoms/s (13 jobs) | 90 / 170 ms |
-| 20,000 | 6,899 | 24.8M | 54,677 | 152,222 datoms/s (12 jobs) | 109 / 181 ms |
-| 200,000 | 6,889 | 24.8M | 54,607 | 148,863 datoms/s (12 jobs) | 110 / 188 ms |
-
-More transactions in flight don't raise the rate: 2,000 already keeps the
-transactor's transaction thread saturated. Commit latency also barely grows
-(90 → 110 ms), although with 200,000 truly outstanding it would be ~29 s. By
-Little's law only about 600–750 transactions are outstanding (p50 × tx/s) at
-any setting. The latency clock starts before `transact-async` is called, so
-the explanation is that `transact-async` itself blocks the consumer once
-roughly that many are outstanding, and each call waits only ~0.15 ms for the
-next slot to free up. The consumer thread used ~7% CPU, consistent with it
-spending most of its time blocked. So `INFLIGHT` above ~750 only delays the
-group barrier; it adds no work in flight. The cap is inferred from these
-measurements, not from Datomic documentation.
-
-## Running
-
-Stage the host once, then submit `indexing.toml`. Everything lives under
-`/mnt/datomic/datomic-bench` and is owned by the Systemslab agent user.
-
-```bash
-# on the host
-for step in prereqs releases harness deps; do ./setup-host.sh $step; done
-START=2024-01-01 ./setup-host.sh data 24        # 24 hourly files from START
-./setup-host.sh verify
-
-# from a workstation
-systemslab submit indexing.toml -p HOST=amd -p BACKUP_NAME=idx-1m
-systemslab submit indexing.toml -p HOST=amd \
-  -p RESTORE_FROM=/mnt/datomic/datomic-bench/backup/idx-1m -p BACKUP_NAME=idx-2m
-```
-
-The preflight checks are sized for the 1B-datom EC2 run. On a host where
-`/mnt/datomic` is a plain directory or the disk is smaller, add
-`-p REQUIRE_MOUNT=false -p MIN_FREE_GIB=20`.
-
-## Data layout on the host
+  # measure transaction and indexing throughput on it (idx-1b-1.0.7705 is the default RESTORE_FROM)
+  systemslab submit tph.toml -p HOST=datomic.bench -p RELEASE=1.0.7745
+  ```
+### Data layout on the host
 
 Everything the benchmark reads or writes lives under one root, `R` in
 `indexing.toml` and `ROOT` in `setup-host.sh` (default
@@ -481,99 +331,7 @@ mind:
 - **No cursor, no resume.** Older backups without `bench-cursor.json` can't be
   restored by `indexing.toml`.
 
-Approximate sizes on amd for comparison: a 1M-datom backup is about 28 MB, a
-2M-datom one about 55 MB, and the 10M-datom `idx-10m` 248 MB (all
-`BATCH=1`). The 96 hourly archive files take 9.4 GB.
 
-Adding the 2024-01-29 and 2024-01-30 files changed the file list, so backups
-whose cursor recorded the older 48-file list (`idx-1m`, `idx-2m`) can no
-longer be resumed.
 
-On EC2, `/mnt/datomic` is instance-store NVMe and is wiped by an instance
-stop/start, together with every backup on it. Stage the host again with
-`setup-host.sh` after one.
 
-## Measurement
 
-### Indexing throughput
-
-Ingest and indexing are separate measurements:
-
-- **Ingest** = datoms added ÷ load wall time. This is end-to-end, so it
-  includes parsing, transacting and any back-pressure from indexing.
-- **Index throughput** = Σ datoms ÷ Σ msec over the index jobs that ran during
-  the phase. The transactor logs one line per index job:
-
-  ```
-  ... datomic.index - {:event :index/create-index, :msec 2660.0, :datoms 488622, ...}
-  ```
-
-  The harness counts the jobs in the transactor log directory before and
-  after the phase and parses the new ones. This is the transactor's own
-  accounting of time spent building indexes. Index jobs run in the background
-  alongside ingest, so this rate is a cost per indexed datom, not a share of
-  wall time. `d/sync-index` alone would only time the trailing merge.
-  `final-index` reports its own jobs, datoms and in-job time the same way.
-
-These lines are collected in `index-jobs.log`. A run's `memory-index-threshold`,
-`memory-index-max`, `index-parallelism` and the other transactor settings are
-in the spec (`p.properties`).
-
-### JVM and host metrics of the transactor
-
-Around each phase, `jvmstats` takes a snapshot of the **transactor** before
-and after, and reports the difference (the `jvm` field of each phase in
-`result.json`):
-
-| Source | Metrics |
-|---|---|
-| JMX (`localhost:7091`) | GC count and time (all collectors), JIT compile time, process CPU time → `proc-cpu-cores`, heap used/max, thread count |
-| `/proc/<pid>/io` | Bytes the transactor read and wrote at the block layer (page-cache hits excluded) → `io-write-MBps` |
-| `/proc/stat` | Host CPU busy and iowait % |
-
-`jit-pct` is cumulative compile time summed across compiler threads, divided
-by wall time. On a short phase it can be large (about 80% for a 35 s load) and
-does not mean 80% of one core.
-
-Datomic's own metrics also flow through `metrics-callback`. Datomic calls
-`bench.metrics/transactor`, and `-Ddatomic.metricsCallback=bench.metrics/peer`
-for the peer, about once a minute. Each payload is appended to
-`metrics-transactor.jsonl` / `metrics-peer.jsonl`, and includes
-`IndexDatoms`, `CreateEntireIndexMsec`, `TransactionMsec`, `MemoryIndexMB`,
-`IndexWriteMsec` and others. These are the supported counterparts of the
-log-parsed numbers, but their once-a-minute resolution is too coarse for runs
-shorter than a few minutes.
-
-### Phase timestamps for Rezolus
-
-Systemslab records host metrics with Rezolus (`metrics.parquet`, one sample
-per second). To cut those metrics by phase, the harness brackets every phase
-with UTC wall-clock markers. They are written to three places:
-
-- `bigindex.log`: `PHASE index start 2026-10-16T12:35:47.207Z (1792154147207)`
-- `phases.jsonl`: one line per marker, appended as it happens, so a crashed
-  run still records the start of the phase it died in
-- `result.json` → `phases`: `start-ms`, `end-ms`, ISO times and duration
-
-`progress.jsonl` adds a wall-clock sample every `SAMPLE_MS` inside the index
-phase. To slice Rezolus by phase, fetch the series and filter by
-`start-ms`/`end-ms`:
-
-```bash
-systemslab promql --experiment <ID> --output json 'sum(rate(cpu_usage[5s]))'
-```
-
-## Outputs
-
-| Artifact | Contents |
-|---|---|
-| `result.json` | Every phase's numbers, `jvm` deltas, `phases`, event-stream cursor |
-| `progress.jsonl` | Growth curve during the index phase |
-| `phases.jsonl` | Phase start/end markers (`indexing.toml`) |
-| `bigindex.log` | Harness console output |
-| `index-jobs.log` | The transactor's `:index/create-index` lines |
-| `metrics-transactor.jsonl` | Datomic metrics callback samples |
-| `cgroup-cpu.txt` | `cpu.stat`, `memory.peak`, `io.stat` per cgroup |
-| `storage.txt` | Database and backup sizes on disk |
-| `transactor.out` | Transactor stdout |
-| `metrics.parquet` | Rezolus host metrics (recorded by Systemslab) |
